@@ -27,6 +27,10 @@ function isBuyable(tile) {
   return tile && (tile.type === 'property' || tile.type === 'station' || tile.type === 'utility');
 }
 
+function clamp(n, a, b) {
+  return Math.max(a, Math.min(b, n));
+}
+
 // ===== Board base (Warsaw) =====
 const BOARD_TILES = [
   { id: 0, type: 'start', name: 'START' },
@@ -82,6 +86,40 @@ const BOARD_TILES = [
   { id: 39, type: 'property', name: 'Aleje Ujazdowskie', price: 400, group: 'darkblue', setSize: 2, rentLevels: [50, 100] },
 ];
 
+const JAIL_TILE_ID = 10;
+const JAIL_FINE = 50;
+
+// ===== Cards (Szansa / Kasa społeczna) =====
+const CHANCE_CARDS = [
+  { id: 'ch_1', text: 'Otrzymujesz +200.', effect: { type: 'money', amount: 200 } },
+  { id: 'ch_2', text: 'Otrzymujesz +25.', effect: { type: 'money', amount: 25 } },
+  { id: 'ch_3', text: 'Zapłać -50.', effect: { type: 'money', amount: -50 } },
+  { id: 'ch_4', text: 'Przesuń się o +3 pola.', effect: { type: 'moveSteps', steps: 3 } },
+  { id: 'ch_5', text: 'Cofnij się o -2 pola.', effect: { type: 'moveSteps', steps: -2 } },
+  { id: 'ch_6', text: 'Idź do więzienia.', effect: { type: 'goToJail' } },
+  { id: 'ch_7', text: 'Idź na START (możesz otrzymać +200 za przejście przez START).', effect: { type: 'moveTo', tileId: 0 } },
+  { id: 'ch_8', text: 'Idź na "Dworzec Centralny".', effect: { type: 'moveTo', tileId: 35 } },
+];
+
+const COMMUNITY_CARDS = [
+  { id: 'co_1', text: 'Otrzymujesz zwrot podatku +200.', effect: { type: 'money', amount: 200 } },
+  { id: 'co_2', text: 'Zapłać rachunek -100.', effect: { type: 'money', amount: -100 } },
+  { id: 'co_3', text: 'Otrzymujesz prezent +50.', effect: { type: 'money', amount: 50 } },
+  { id: 'co_4', text: 'Cofnij się o -3 pola.', effect: { type: 'moveSteps', steps: -3 } },
+  { id: 'co_5', text: 'Przesuń się o +2 pola.', effect: { type: 'moveSteps', steps: 2 } },
+  { id: 'co_6', text: 'Idź do więzienia.', effect: { type: 'goToJail' } },
+  { id: 'co_7', text: 'Idź na "Podatek dochodowy".', effect: { type: 'moveTo', tileId: 4 } },
+];
+
+function shuffleArray(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
 const rooms = {};
 
 function createRoomBoard() {
@@ -97,6 +135,8 @@ function createPlayer(socketId, nickname, colorKey) {
     balance: 1500,
     properties: [],
     isBankrupt: false,
+    inJail: false,
+    jailTurnsLeft: 0,
   };
 }
 
@@ -123,6 +163,11 @@ function emitToastToPlayer(playerId, payload) {
   io.to(playerId).emit('toast', payload);
 }
 
+function emitPaymentPromptToPlayer(playerId, payload) {
+  io.to(playerId).emit('paymentPrompt', payload);
+  io.to(playerId).emit('payment_prompt', payload);
+}
+
 function emitGameState(roomCode) {
   const room = rooms[roomCode];
   if (!room) return;
@@ -146,6 +191,8 @@ function emitGameState(roomCode) {
       position: p.position,
       balance: p.balance,
       isBankrupt: Boolean(p.isBankrupt),
+      inJail: Boolean(p.inJail),
+      jailTurnsLeft: Number(p.jailTurnsLeft || 0),
     })),
     currentPlayerId: current ? current.id : null,
     board: room.board,
@@ -163,10 +210,6 @@ function getPlayerById(room, playerId) {
 
 function getActivePlayers(room) {
   return room.players.filter((p) => !p.isBankrupt);
-}
-
-function clamp(n, a, b) {
-  return Math.max(a, Math.min(b, n));
 }
 
 // ===== Rent helpers =====
@@ -257,13 +300,14 @@ function handleBankruptcy(roomCode, playerId) {
   pl.isBankrupt = true;
   pl.balance = 0;
   pl.properties = [];
+  pl.inJail = false;
+  pl.jailTurnsLeft = 0;
 
   releasePropertiesToBank(room, pl.id);
 
   emitLog(roomCode, `Gracz ${pl.nickname} zbankrutował.`);
   emitToastToPlayer(pl.id, { type: 'err', text: 'Bankructwo!' });
 
-  // If bankrupt player was current, move to next active
   ensureCurrentIsActive(room);
 
   room.phase = 'awaiting_roll';
@@ -273,6 +317,327 @@ function handleBankruptcy(roomCode, playerId) {
   checkWinner(roomCode);
 
   return true;
+}
+
+// ===== Movement paths (for animation) =====
+function buildForwardPath(startPos, steps, len) {
+  const path = [];
+  let pos = startPos;
+  for (let i = 0; i < steps; i += 1) {
+    pos = (pos + 1) % len;
+    path.push(pos);
+  }
+  return path;
+}
+
+function buildBackwardPath(startPos, stepsAbs, len) {
+  const path = [];
+  let pos = startPos;
+  for (let i = 0; i < stepsAbs; i += 1) {
+    pos = (pos - 1 + len) % len;
+    path.push(pos);
+  }
+  return path;
+}
+
+function buildPathToForward(startPos, targetPos, len) {
+  const path = [];
+  let pos = startPos;
+  while (pos !== targetPos) {
+    pos = (pos + 1) % len;
+    path.push(pos);
+    if (path.length > len + 2) break;
+  }
+  return path;
+}
+
+// ===== Cards / Jail helpers =====
+function initDecks(room) {
+  room.chanceDeck = shuffleArray(CHANCE_CARDS);
+  room.chancePos = 0;
+
+  room.communityDeck = shuffleArray(COMMUNITY_CARDS);
+  room.communityPos = 0;
+}
+
+function drawCard(room, deckType) {
+  const isChance = deckType === 'chance';
+
+  const deck = isChance ? room.chanceDeck : room.communityDeck;
+  let pos = isChance ? room.chancePos : room.communityPos;
+
+  if (!Array.isArray(deck) || deck.length === 0) return null;
+
+  if (pos >= deck.length) pos = 0;
+  const card = deck[pos];
+
+  pos += 1;
+  if (isChance) room.chancePos = pos;
+  else room.communityPos = pos;
+
+  return card || null;
+}
+
+function sendToJail(roomCode, room, player, reason = 'jail') {
+  player.position = JAIL_TILE_ID;
+  player.inJail = true;
+  player.jailTurnsLeft = 1;
+
+  io.to(roomCode).emit('playerMovePath', { playerId: player.id, path: [JAIL_TILE_ID], reason });
+
+  emitLog(roomCode, `${player.nickname} idzie do więzienia.`);
+  emitToastToPlayer(player.id, { type: 'err', text: 'Więzienie' });
+}
+
+function maybePromptJail(roomCode, room, player) {
+  if (!player.inJail || player.jailTurnsLeft <= 0) return false;
+
+  room.phase = 'awaiting_jail_choice';
+  room.pending = { type: 'jail', playerId: player.id, fine: JAIL_FINE };
+
+  emitGameState(roomCode);
+
+  io.to(player.id).emit('jailPrompt', { playerId: player.id, fine: JAIL_FINE });
+  io.to(player.id).emit('jail_prompt', { playerId: player.id, fine: JAIL_FINE });
+
+  emitLog(roomCode, `${player.nickname} jest w więzieniu: wybór (zapłać ${JAIL_FINE} lub pomiń turę).`);
+  return true;
+}
+
+function resolveLanding(roomCode, room, player, diceSum, fromCard = false) {
+  const tile = room.board[player.position];
+
+  // GO TO JAIL tile
+  if (tile.type === 'go_to_jail') {
+    sendToJail(roomCode, room, player, 'tile');
+
+    room.phase = 'awaiting_roll';
+    room.pending = null;
+    advanceTurn(room);
+    emitGameState(roomCode);
+    checkWinner(roomCode);
+
+    return { phase: 'awaiting_roll', endedTurn: true };
+  }
+
+  // TAX
+  if (tile.type === 'tax' && typeof tile.amount === 'number') {
+    const taxAmount = Number(tile.amount);
+    player.balance -= taxAmount;
+
+    emitLog(roomCode, `${player.nickname} zapłacił podatek ${taxAmount} na polu "${tile.name}".`);
+    emitToastToPlayer(player.id, { type: 'err', text: `Podatek: -${taxAmount} (${tile.name})` });
+
+    emitPaymentPromptToPlayer(player.id, {
+      type: 'tax',
+      amount: taxAmount,
+      tileName: tile.name,
+    });
+
+    if (handleBankruptcy(roomCode, player.id)) {
+      advanceTurn(room);
+      emitGameState(roomCode);
+      return { phase: 'awaiting_roll', endedTurn: true };
+    }
+  }
+
+  // RENT
+  if (isBuyable(tile) && tile.ownerId && tile.ownerId !== player.id) {
+    const owner = getPlayerById(room, tile.ownerId);
+    const rent = computeRent(room, tile, diceSum);
+
+    if (owner && rent > 0) {
+      player.balance -= rent;
+      owner.balance += rent;
+
+      emitLog(roomCode, `${player.nickname} zapłacił czynsz ${rent} dla ${owner.nickname} (${tile.name}).`);
+      emitToastToPlayer(player.id, { type: 'err', text: `Czynsz: -${rent} → ${owner.nickname} (${tile.name})` });
+      emitToastToPlayer(owner.id, { type: 'ok', text: `Czynsz: +${rent} od ${player.nickname} (${tile.name})` });
+
+      emitPaymentPromptToPlayer(player.id, {
+        type: 'rent',
+        amount: rent,
+        toNickname: owner.nickname,
+        tileName: tile.name,
+      });
+
+      if (handleBankruptcy(roomCode, player.id)) {
+        advanceTurn(room);
+        emitGameState(roomCode);
+        return { phase: 'awaiting_roll', endedTurn: true };
+      }
+    } else {
+      emitLog(roomCode, `Nie udało się naliczyć czynszu dla pola "${tile.name}".`);
+    }
+  }
+
+  // CARDS: draw card and WAIT for ack
+  if (!fromCard && (tile.type === 'random' || tile.type === 'chest')) {
+    const deckType = tile.type === 'random' ? 'chance' : 'community';
+    const deckLabel = deckType === 'chance' ? 'Szansa' : 'Kasa społeczna';
+
+    const card = drawCard(room, deckType);
+    if (card) {
+      emitLog(roomCode, `${player.nickname} wylosował kartę: ${deckLabel} — "${card.text}".`);
+
+      room.phase = 'awaiting_card_ack';
+      room.pending = {
+        type: 'card',
+        playerId: player.id,
+        deckType,
+        deckLabel,
+        card,
+        diceSum: Number(diceSum || 0),
+      };
+
+      emitGameState(roomCode);
+
+      io.to(player.id).emit('cardDrawn', {
+        deckType,
+        deckLabel,
+        text: card.text,
+        playerId: player.id,
+        nickname: player.nickname,
+        colorKey: player.colorKey,
+      });
+      io.to(player.id).emit('card_drawn', {
+        deckType,
+        deckLabel,
+        text: card.text,
+        playerId: player.id,
+        nickname: player.nickname,
+        colorKey: player.colorKey,
+      });
+
+      return { phase: 'awaiting_card_ack', endedTurn: false };
+    }
+  }
+
+  emitGameState(roomCode);
+
+  // Buy phase if unowned
+  if (isBuyable(tile) && !tile.ownerId && typeof tile.price === 'number') {
+    room.phase = 'awaiting_buy';
+    room.pending = { playerId: player.id, tileId: tile.id };
+    emitGameState(roomCode);
+    return { phase: 'awaiting_buy', endedTurn: false };
+  }
+
+  // End turn
+  room.phase = 'awaiting_roll';
+  room.pending = null;
+  advanceTurn(room);
+  emitGameState(roomCode);
+  return { phase: 'awaiting_roll', endedTurn: true };
+}
+
+function applyCardEffectAfterAck(roomCode, room, player, pendingCard) {
+  const card = pendingCard.card;
+  const diceSum = Number(pendingCard.diceSum || 0);
+  const eff = card?.effect || null;
+
+  if (!eff || !eff.type) {
+    emitLog(roomCode, 'Efekt: brak.');
+    room.phase = 'awaiting_roll';
+    room.pending = null;
+    advanceTurn(room);
+    emitGameState(roomCode);
+    return { phase: 'awaiting_roll', endedTurn: true };
+  }
+
+  if (eff.type === 'money') {
+    const amt = Number(eff.amount || 0);
+    player.balance += amt;
+
+    if (amt >= 0) {
+      emitLog(roomCode, `Efekt: ${player.nickname} otrzymał +${amt}.`);
+      emitToastToPlayer(player.id, { type: 'ok', text: `+${amt}` });
+    } else {
+      emitLog(roomCode, `Efekt: ${player.nickname} zapłacił ${Math.abs(amt)}.`);
+      emitToastToPlayer(player.id, { type: 'err', text: `-${Math.abs(amt)}` });
+
+      emitPaymentPromptToPlayer(player.id, {
+        type: 'fee',
+        amount: Math.abs(amt),
+        label: 'Opłata',
+      });
+    }
+
+    if (handleBankruptcy(roomCode, player.id)) {
+      room.phase = 'awaiting_roll';
+      room.pending = null;
+      advanceTurn(room);
+      emitGameState(roomCode);
+      checkWinner(roomCode);
+      return { phase: 'awaiting_roll', endedTurn: true };
+    }
+
+    room.phase = 'awaiting_roll';
+    room.pending = null;
+    advanceTurn(room);
+    emitGameState(roomCode);
+    return { phase: 'awaiting_roll', endedTurn: true };
+  }
+
+  if (eff.type === 'goToJail') {
+    emitLog(roomCode, `Efekt: ${player.nickname} idzie do więzienia.`);
+    sendToJail(roomCode, room, player, 'card');
+
+    room.phase = 'awaiting_roll';
+    room.pending = null;
+    advanceTurn(room);
+    emitGameState(roomCode);
+    checkWinner(roomCode);
+    return { phase: 'awaiting_roll', endedTurn: true };
+  }
+
+  if (eff.type === 'moveSteps') {
+    const steps = Number(eff.steps || 0);
+    const len = room.board.length;
+    const startPos = player.position;
+
+    let path = [];
+    if (steps >= 0) path = buildForwardPath(startPos, steps, len);
+    else path = buildBackwardPath(startPos, Math.abs(steps), len);
+
+    if (path.length > 0) {
+      player.position = path[path.length - 1];
+      io.to(roomCode).emit('playerMovePath', { playerId: player.id, path, reason: 'card' });
+    }
+
+    emitLog(roomCode, `Efekt: ${player.nickname} przesuwa się o ${steps} pola.`);
+
+    return resolveLanding(roomCode, room, player, diceSum, true);
+  }
+
+  if (eff.type === 'moveTo') {
+    const len = room.board.length;
+    const startPos = player.position;
+    let target = Number(eff.tileId || 0) % len;
+    if (target < 0) target += len;
+
+    const path = buildPathToForward(startPos, target, len);
+
+    if (target < startPos) {
+      player.balance += 200;
+      emitLog(roomCode, `${player.nickname} przeszedł przez START i otrzymał +200.`);
+      emitToastToPlayer(player.id, { type: 'ok', text: 'START: +200' });
+    }
+
+    player.position = target;
+    io.to(roomCode).emit('playerMovePath', { playerId: player.id, path: path.length ? path : [target], reason: 'card' });
+
+    emitLog(roomCode, `Efekt: ${player.nickname} idzie na pole: ${room.board[target]?.name || target}.`);
+
+    return resolveLanding(roomCode, room, player, diceSum, true);
+  }
+
+  emitLog(roomCode, 'Efekt: nieznany.');
+  room.phase = 'awaiting_roll';
+  room.pending = null;
+  advanceTurn(room);
+  emitGameState(roomCode);
+  return { phase: 'awaiting_roll', endedTurn: true };
 }
 
 function resetGame(roomCode) {
@@ -291,8 +656,11 @@ function resetGame(roomCode) {
     p.balance = 1500;
     p.properties = [];
     p.isBankrupt = false;
+    p.inJail = false;
+    p.jailTurnsLeft = 0;
   });
 
+  initDecks(room);
   ensureCurrentIsActive(room);
 
   io.to(roomCode).emit('gameReset');
@@ -316,10 +684,15 @@ io.on('connection', (socket) => {
         pending: null,
         gameOver: false,
         winnerId: null,
+        chanceDeck: [],
+        chancePos: 0,
+        communityDeck: [],
+        communityPos: 0,
       };
 
       const colorKey = pickNextColor(room);
       room.players.push(createPlayer(socket.id, nickname, colorKey));
+      initDecks(room);
       rooms[roomCode] = room;
 
       socket.join(roomCode);
@@ -404,8 +777,11 @@ io.on('connection', (socket) => {
       p.balance = 1500;
       p.properties = [];
       p.isBankrupt = false;
+      p.inJail = false;
+      p.jailTurnsLeft = 0;
     });
 
+    initDecks(room);
     ensureCurrentIsActive(room);
 
     emitRoomUpdate(roomCode);
@@ -428,11 +804,103 @@ io.on('connection', (socket) => {
     io.to(roomCode).emit('newMessage', { nickname, message, timestamp: new Date().toISOString() });
   });
 
+  // Jail choice
+  function handleJailChoice({ roomCode, pay }, callback) {
+    const room = rooms[roomCode];
+    if (!room || room.status !== 'playing') return callback?.({ ok: false, error: 'NOT_PLAYING' });
+    if (room.gameOver) return callback?.({ ok: false, error: 'GAME_OVER' });
+
+    ensureCurrentIsActive(room);
+
+    const currentPlayer = room.players[room.currentPlayerIndex];
+    if (!currentPlayer) return callback?.({ ok: false, error: 'NO_CURRENT_PLAYER' });
+    if (currentPlayer.id !== socket.id) return callback?.({ ok: false, error: 'NOT_YOUR_TURN' });
+    if (currentPlayer.isBankrupt) return callback?.({ ok: false, error: 'BANKRUPT' });
+
+    if (room.phase !== 'awaiting_jail_choice' || !room.pending || room.pending.type !== 'jail' || room.pending.playerId !== socket.id) {
+      return callback?.({ ok: false, error: 'NOT_IN_JAIL_CHOICE' });
+    }
+
+    const fine = Number(room.pending.fine || JAIL_FINE);
+
+    if (Boolean(pay)) {
+      currentPlayer.balance -= fine;
+      currentPlayer.inJail = false;
+      currentPlayer.jailTurnsLeft = 0;
+
+      emitLog(roomCode, `${currentPlayer.nickname} zapłacił ${fine} i wychodzi z więzienia.`);
+      emitToastToPlayer(currentPlayer.id, { type: 'err', text: `Więzienie: -${fine}` });
+
+      emitPaymentPromptToPlayer(currentPlayer.id, {
+        type: 'fee',
+        amount: fine,
+        label: 'Więzienie',
+      });
+
+      room.phase = 'awaiting_roll';
+      room.pending = null;
+
+      emitGameState(roomCode);
+
+      if (handleBankruptcy(roomCode, currentPlayer.id)) {
+        advanceTurn(room);
+        emitGameState(roomCode);
+        checkWinner(roomCode);
+        return callback?.({ ok: true, phase: 'awaiting_roll' });
+      }
+
+      return callback?.({ ok: true, phase: 'awaiting_roll' });
+    }
+
+    currentPlayer.jailTurnsLeft = Math.max(0, Number(currentPlayer.jailTurnsLeft || 0) - 1);
+    emitLog(roomCode, `${currentPlayer.nickname} zostaje w więzieniu i pomija turę.`);
+
+    if (currentPlayer.jailTurnsLeft <= 0) {
+      currentPlayer.inJail = false;
+      emitLog(roomCode, `${currentPlayer.nickname} wychodzi z więzienia.`);
+    }
+
+    room.phase = 'awaiting_roll';
+    room.pending = null;
+    advanceTurn(room);
+    emitGameState(roomCode);
+    callback?.({ ok: true, phase: 'awaiting_roll' });
+  }
+
+  socket.on('jailChoice', handleJailChoice);
+  socket.on('jail_choice', handleJailChoice);
+
+  // Card ack (OK)
+  function handleCardAck({ roomCode }, callback) {
+    const room = rooms[roomCode];
+    if (!room || room.status !== 'playing') return callback?.({ ok: false, error: 'NOT_PLAYING' });
+    if (room.gameOver) return callback?.({ ok: false, error: 'GAME_OVER' });
+
+    ensureCurrentIsActive(room);
+
+    const currentPlayer = room.players[room.currentPlayerIndex];
+    if (!currentPlayer) return callback?.({ ok: false, error: 'NO_CURRENT_PLAYER' });
+    if (currentPlayer.id !== socket.id) return callback?.({ ok: false, error: 'NOT_YOUR_TURN' });
+    if (currentPlayer.isBankrupt) return callback?.({ ok: false, error: 'BANKRUPT' });
+
+    if (room.phase !== 'awaiting_card_ack' || !room.pending || room.pending.type !== 'card' || room.pending.playerId !== socket.id) {
+      return callback?.({ ok: false, error: 'NOT_IN_CARD_ACK' });
+    }
+
+    const pendingCard = room.pending;
+    room.pending = null;
+
+    const result = applyCardEffectAfterAck(roomCode, room, currentPlayer, pendingCard);
+    return callback?.({ ok: true, phase: result?.phase || room.phase });
+  }
+
+  socket.on('cardAck', handleCardAck);
+  socket.on('card_ack', handleCardAck);
+
   socket.on('rollDice', ({ roomCode }, callback) => {
     const room = rooms[roomCode];
     if (!room || room.status !== 'playing') return callback?.({ ok: false, error: 'NOT_PLAYING' });
     if (room.gameOver) return callback?.({ ok: false, error: 'GAME_OVER' });
-    if (room.phase !== 'awaiting_roll') return callback?.({ ok: false, error: 'WAITING_FOR_BUY' });
 
     ensureCurrentIsActive(room);
 
@@ -441,20 +909,31 @@ io.on('connection', (socket) => {
     if (currentPlayer.isBankrupt) return callback?.({ ok: false, error: 'BANKRUPT' });
     if (currentPlayer.id !== socket.id) return callback?.({ ok: false, error: 'NOT_YOUR_TURN' });
 
+    if (room.phase !== 'awaiting_roll') return callback?.({ ok: false, error: 'NOT_IN_ROLL_PHASE' });
+
+    // Jail gate
+    if (currentPlayer.inJail && currentPlayer.jailTurnsLeft > 0) {
+      const prompted = maybePromptJail(roomCode, room, currentPlayer);
+      if (prompted) return callback?.({ ok: true, phase: 'awaiting_jail_choice' });
+    }
+
     const dice1 = Math.floor(Math.random() * 6) + 1;
     const dice2 = Math.floor(Math.random() * 6) + 1;
     const steps = dice1 + dice2;
 
-    let newPosition = currentPlayer.position + steps;
-    if (newPosition >= room.board.length) {
-      newPosition = newPosition % room.board.length;
+    const oldPos = currentPlayer.position;
+    let newPos = oldPos + steps;
+    const len = room.board.length;
+
+    if (newPos >= len) {
+      newPos = newPos % len;
       currentPlayer.balance += 200;
       emitLog(roomCode, `${currentPlayer.nickname} przeszedł przez START i otrzymał +200.`);
       emitToastToPlayer(currentPlayer.id, { type: 'ok', text: 'START: +200' });
     }
 
-    currentPlayer.position = newPosition;
-    const tile = room.board[newPosition];
+    currentPlayer.position = newPos;
+    const tile = room.board[newPos];
 
     io.to(roomCode).emit('diceRolled', {
       playerId: currentPlayer.id,
@@ -462,67 +941,17 @@ io.on('connection', (socket) => {
       dice1,
       dice2,
       steps,
-      newPosition,
+      newPosition: newPos,
       tile,
     });
 
+    const path = buildForwardPath(oldPos, steps, len);
+    io.to(roomCode).emit('playerMovePath', { playerId: currentPlayer.id, path, reason: 'dice' });
+
     emitLog(roomCode, `${currentPlayer.nickname} rzucił ${dice1}+${dice2}=${steps} → ${tile.name}.`);
 
-    const diceSum = steps;
-
-    // TAX
-    if (tile.type === 'tax' && typeof tile.amount === 'number') {
-      currentPlayer.balance -= tile.amount;
-      emitLog(roomCode, `${currentPlayer.nickname} zapłacił podatek ${tile.amount} na polu "${tile.name}".`);
-      emitToastToPlayer(currentPlayer.id, { type: 'err', text: `Podatek: -${tile.amount} (${tile.name})` });
-
-      if (handleBankruptcy(roomCode, currentPlayer.id)) {
-        // turn ends if bankrupt
-        advanceTurn(room);
-        emitGameState(roomCode);
-        return callback?.({ ok: true, phase: 'awaiting_roll' });
-      }
-    }
-
-    // RENT
-    if (isBuyable(tile) && tile.ownerId && tile.ownerId !== currentPlayer.id) {
-      const owner = getPlayerById(room, tile.ownerId);
-      const rent = computeRent(room, tile, diceSum);
-
-      if (owner && rent > 0) {
-        currentPlayer.balance -= rent;
-        owner.balance += rent;
-
-        emitLog(roomCode, `${currentPlayer.nickname} zapłacił czynsz ${rent} dla ${owner.nickname} (${tile.name}).`);
-        emitToastToPlayer(currentPlayer.id, { type: 'err', text: `Czynsz: -${rent} → ${owner.nickname} (${tile.name})` });
-        emitToastToPlayer(owner.id, { type: 'ok', text: `Czynsz: +${rent} od ${currentPlayer.nickname} (${tile.name})` });
-
-        if (handleBankruptcy(roomCode, currentPlayer.id)) {
-          advanceTurn(room);
-          emitGameState(roomCode);
-          return callback?.({ ok: true, phase: 'awaiting_roll' });
-        }
-      } else {
-        emitLog(roomCode, `Nie udało się naliczyć czynszu dla pola "${tile.name}".`);
-      }
-    }
-
-    emitGameState(roomCode);
-
-    // Buy phase if unowned
-    if (isBuyable(tile) && !tile.ownerId && typeof tile.price === 'number') {
-      room.phase = 'awaiting_buy';
-      room.pending = { playerId: currentPlayer.id, tileId: tile.id };
-      emitGameState(roomCode);
-      return callback?.({ ok: true, phase: 'awaiting_buy' });
-    }
-
-    // End turn
-    room.phase = 'awaiting_roll';
-    room.pending = null;
-    advanceTurn(room);
-    emitGameState(roomCode);
-    callback?.({ ok: true, phase: 'awaiting_roll' });
+    const result = resolveLanding(roomCode, room, currentPlayer, steps, false);
+    return callback?.({ ok: true, phase: result?.phase || room.phase });
   });
 
   socket.on('buyTile', ({ roomCode }, callback) => {
@@ -599,7 +1028,6 @@ io.on('connection', (socket) => {
 
       const left = room.players[idx];
 
-      // If player leaves during play, release their properties
       if (room.status === 'playing') {
         releasePropertiesToBank(room, left.id);
       }

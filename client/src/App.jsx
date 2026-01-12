@@ -65,6 +65,41 @@ function makeRange(from, to) {
   return arr;
 }
 
+function formatPaymentTitle(payload) {
+  const t = payload?.type;
+  if (t === 'rent') return 'Czynsz';
+  if (t === 'tax') return 'Podatek';
+  return payload?.label || 'Opłata';
+}
+
+function formatPaymentBody(payload) {
+  const t = payload?.type;
+  const amount = Number(payload?.amount || 0);
+
+  if (t === 'rent') {
+    const toNick = payload?.toNickname || 'gracz';
+    const tileName = payload?.tileName ? ` (${payload.tileName})` : '';
+    return `Zapłać czynsz ${amount} dla ${toNick}${tileName}.`;
+  }
+
+  if (t === 'tax') {
+    const tileName = payload?.tileName ? ` (${payload.tileName})` : '';
+    return `Zapłać podatek ${amount}${tileName}.`;
+  }
+
+  const label = payload?.label || 'Opłata';
+  return `Zapłać ${label}: ${amount}.`;
+}
+
+function formatPaymentButton(payload) {
+  const t = payload?.type;
+  const amount = Number(payload?.amount || 0);
+  if (t === 'rent') return `Zapłać czynsz ${amount}`;
+  if (t === 'tax') return `Zapłać podatek ${amount}`;
+  const label = payload?.label || 'Opłata';
+  return `Zapłać ${label} ${amount}`;
+}
+
 export default function App() {
   const [nickname, setNickname] = useState('');
   const [roomCode, setRoomCode] = useState('');
@@ -88,14 +123,83 @@ export default function App() {
   const [socketId, setSocketId] = useState(null);
   const [animatedPositions, setAnimatedPositions] = useState({});
 
+  const animatingRef = useRef({}); // { [playerId]: true }
+  const timersRef = useRef({}); // { [playerId]: { timer?: any, preTimer?: any } }
+
   const [toast, setToast] = useState(null); // { type:'ok'|'err', text }
 
   // Winner modal
   const [showWinnerModal, setShowWinnerModal] = useState(false);
 
+  // Card modal
+  const [cardModal, setCardModal] = useState(null); // { deckLabel, text, nickname, colorKey }
+
+  // Jail modal
+  const [jailModal, setJailModal] = useState(null); // { fine:number }
+
+  // Payment modal (queue)
+  const [paymentQueue, setPaymentQueue] = useState([]); // array of payloads
+
+  const paymentModal = paymentQueue.length > 0 ? paymentQueue[0] : null;
+
   // Scroll handling (auto-scroll only if user is at bottom)
   const activityScrollRef = useRef(null);
   const stickToBottomRef = useRef(true);
+
+  function setAnimating(playerId, value) {
+    if (!playerId) return;
+    if (value) animatingRef.current[playerId] = true;
+    else delete animatingRef.current[playerId];
+  }
+
+  function isAnimating(playerId) {
+    return Boolean(playerId && animatingRef.current[playerId]);
+  }
+
+  function stopAnimation(playerId) {
+    const entry = timersRef.current[playerId];
+    if (entry?.timer) clearTimeout(entry.timer);
+    if (entry?.preTimer) clearTimeout(entry.preTimer);
+    delete timersRef.current[playerId];
+    setAnimating(playerId, false);
+  }
+
+  function startAnimation(playerId, path) {
+    stopAnimation(playerId);
+
+    if (!Array.isArray(path) || path.length === 0) return;
+
+    setAnimating(playerId, true);
+
+    let idx = 0;
+    const stepMs = 180;
+
+    const run = () => {
+      const pos = path[idx];
+      setAnimatedPositions((prev) => ({ ...prev, [playerId]: pos }));
+      idx += 1;
+
+      if (idx >= path.length) {
+        stopAnimation(playerId);
+        return;
+      }
+
+      timersRef.current[playerId] = { ...timersRef.current[playerId], timer: setTimeout(run, stepMs) };
+    };
+
+    timersRef.current[playerId] = { ...timersRef.current[playerId], timer: setTimeout(run, stepMs) };
+  }
+
+  function markPreAnimation(playerId) {
+    if (!playerId) return;
+    // This prevents the "teleport first frame" caused by gameState arriving before playerMovePath
+    setAnimating(playerId, true);
+    const preTimer = setTimeout(() => {
+      // fallback: if path never arrives, unlock after a short time
+      stopAnimation(playerId);
+    }, 2200);
+    timersRef.current[playerId] = { ...timersRef.current[playerId], preTimer };
+  }
 
   useEffect(() => {
     const el = activityScrollRef.current;
@@ -119,65 +223,152 @@ export default function App() {
     if (stickToBottomRef.current) el.scrollTop = el.scrollHeight;
   }, [messages, gameLog, activeTab]);
 
+  // Show payment modal only when you are not in another modal and not animating
+  useEffect(() => {
+    if (!paymentModal) return;
+    if (cardModal) return;
+    if (jailModal) return;
+    if (showWinnerModal && gameState?.gameOver) return;
+
+    // If you are animating, wait until animation finishes
+    if (socketId && isAnimating(socketId)) return;
+  }, [paymentModal, cardModal, jailModal, showWinnerModal, gameState, socketId]);
+
   useEffect(() => {
     const updateSocketId = () => setSocketId(socket.id || null);
     updateSocketId();
+
+    const onRoomUpdate = (payload) => {
+      setRoomStatus(payload.status || 'waiting');
+      setHostId(payload.hostId || null);
+      setReadyById(payload.readyById || {});
+      setPlayers(payload.players || []);
+    };
+
+    const onNewMessage = (msg) => setMessages((prev) => [...prev, msg]);
+    const onGameLogEvent = (entry) => setGameLog((prev) => [...prev, entry]);
+
+    const onGameReset = () => {
+      setGameLog([]);
+      setDiceInfo(null);
+      setShowWinnerModal(false);
+      setCardModal(null);
+      setJailModal(null);
+      setPaymentQueue([]);
+      setAnimatedPositions({});
+      setToast({ type: 'ok', text: 'Nowa gra' });
+      setTimeout(() => setToast(null), 1600);
+    };
+
+    const onGameState = (state) => {
+      setGameState(state);
+
+      // IMPORTANT: do NOT overwrite animated position while player is animating (fixes "teleport first frame")
+      setAnimatedPositions((prev) => {
+        const next = { ...prev };
+        (state.players || []).forEach((pl) => {
+          if (!isAnimating(pl.id)) {
+            next[pl.id] = pl.position;
+          } else if (next[pl.id] === undefined || next[pl.id] === null) {
+            // If animating but no local pos yet, keep server as initial
+            next[pl.id] = pl.position;
+          }
+        });
+        return next;
+      });
+    };
+
+    const onDiceRolled = (info) => {
+      setDiceInfo(info);
+      // Mark pre-animation to prevent gameState from teleporting the piece before path arrives
+      markPreAnimation(info?.playerId);
+    };
+
+    const onPlayerMovePath = (payload) => {
+      if (!payload || !payload.playerId) return;
+      const path = Array.isArray(payload.path) ? payload.path : [];
+
+      // Replace preTimer animation lock with real animation
+      const entry = timersRef.current[payload.playerId];
+      if (entry?.preTimer) clearTimeout(entry.preTimer);
+      timersRef.current[payload.playerId] = { ...entry, preTimer: null };
+
+      startAnimation(payload.playerId, path);
+    };
+
+    const onToast = (payload) => {
+      if (!payload || !payload.text) return;
+      setToast({ type: payload.type === 'ok' ? 'ok' : 'err', text: String(payload.text) });
+      setTimeout(() => setToast(null), 2200);
+    };
+
+    const onCardDrawn = (payload) => {
+      if (!payload) return;
+      setCardModal({
+        deckLabel: payload.deckLabel || (payload.deckType === 'chance' ? 'Szansa' : 'Kasa społeczna'),
+        text: String(payload.text || ''),
+        nickname: payload.nickname || null,
+        colorKey: payload.colorKey || 'blue',
+      });
+    };
+
+    const onJailPrompt = (payload) => {
+      if (!payload) return;
+      if (payload.playerId && socket.id && payload.playerId !== socket.id) return;
+      const fine = typeof payload.fine === 'number' ? payload.fine : 50;
+      setJailModal({ fine });
+    };
+
+    const onPaymentPrompt = (payload) => {
+      if (!payload) return;
+      // queue; will show only to the player who received it (server sends to payer socket only)
+      setPaymentQueue((prev) => [...prev, payload]);
+    };
 
     socket.on('connect', updateSocketId);
     socket.on('reconnect', updateSocketId);
     socket.on('disconnect', () => setSocketId(null));
 
-    socket.on('roomUpdate', (payload) => {
-      setRoomStatus(payload.status || 'waiting');
-      setHostId(payload.hostId || null);
-      setReadyById(payload.readyById || {});
-      setPlayers(payload.players || []);
-    });
+    socket.on('roomUpdate', onRoomUpdate);
+    socket.on('newMessage', onNewMessage);
+    socket.on('gameLogEvent', onGameLogEvent);
+    socket.on('gameReset', onGameReset);
+    socket.on('gameState', onGameState);
+    socket.on('diceRolled', onDiceRolled);
+    socket.on('playerMovePath', onPlayerMovePath);
+    socket.on('toast', onToast);
 
-    socket.on('newMessage', (msg) => setMessages((prev) => [...prev, msg]));
-    socket.on('gameLogEvent', (entry) => setGameLog((prev) => [...prev, entry]));
+    socket.on('cardDrawn', onCardDrawn);
+    socket.on('card_drawn', onCardDrawn);
 
-    socket.on('gameReset', () => {
-      setGameLog([]);
-      setDiceInfo(null);
-      setShowWinnerModal(false);
-      setToast({ type: 'ok', text: 'Nowa gra' });
-      setTimeout(() => setToast(null), 1600);
-    });
+    socket.on('jailPrompt', onJailPrompt);
+    socket.on('jail_prompt', onJailPrompt);
 
-    socket.on('gameState', (state) => {
-      setGameState(state);
-      setAnimatedPositions((prev) => {
-        const next = { ...prev };
-        (state.players || []).forEach((pl) => {
-          if (next[pl.id] === undefined || next[pl.id] === null) next[pl.id] = pl.position;
-        });
-        return next;
-      });
-    });
-
-    socket.on('diceRolled', (info) => {
-      setDiceInfo(info);
-      setAnimatedPositions((prev) => ({ ...prev, [info.playerId]: info.newPosition }));
-    });
-
-    socket.on('toast', (payload) => {
-      if (!payload || !payload.text) return;
-      setToast({ type: payload.type === 'ok' ? 'ok' : 'err', text: String(payload.text) });
-      setTimeout(() => setToast(null), 2200);
-    });
+    socket.on('paymentPrompt', onPaymentPrompt);
+    socket.on('payment_prompt', onPaymentPrompt);
 
     return () => {
       socket.off('connect', updateSocketId);
       socket.off('reconnect', updateSocketId);
       socket.off('disconnect');
-      socket.off('roomUpdate');
-      socket.off('newMessage');
-      socket.off('gameLogEvent');
-      socket.off('gameReset');
-      socket.off('gameState');
-      socket.off('diceRolled');
-      socket.off('toast');
+
+      socket.off('roomUpdate', onRoomUpdate);
+      socket.off('newMessage', onNewMessage);
+      socket.off('gameLogEvent', onGameLogEvent);
+      socket.off('gameReset', onGameReset);
+      socket.off('gameState', onGameState);
+      socket.off('diceRolled', onDiceRolled);
+      socket.off('playerMovePath', onPlayerMovePath);
+      socket.off('toast', onToast);
+
+      socket.off('cardDrawn', onCardDrawn);
+      socket.off('card_drawn', onCardDrawn);
+
+      socket.off('jailPrompt', onJailPrompt);
+      socket.off('jail_prompt', onJailPrompt);
+
+      socket.off('paymentPrompt', onPaymentPrompt);
+      socket.off('payment_prompt', onPaymentPrompt);
     };
   }, []);
 
@@ -211,6 +402,11 @@ export default function App() {
     if (gameOver) setShowWinnerModal(true);
   }, [gameOver]);
 
+  useEffect(() => {
+    if (!jailModal) return;
+    if (gameOver) setJailModal(null);
+  }, [jailModal, gameOver]);
+
   const handleCreateRoom = () => {
     if (!nickname.trim()) return setError('Podaj swój nick');
     setError('');
@@ -237,8 +433,12 @@ export default function App() {
       setGameState(null);
       setDiceInfo(null);
       setAnimatedPositions({});
+      setAnimating(socket.id, false);
       setToast(null);
       setShowWinnerModal(false);
+      setCardModal(null);
+      setJailModal(null);
+      setPaymentQueue([]);
     });
   };
 
@@ -280,6 +480,9 @@ export default function App() {
       setAnimatedPositions({});
       setToast(null);
       setShowWinnerModal(false);
+      setCardModal(null);
+      setJailModal(null);
+      setPaymentQueue([]);
     });
   };
 
@@ -332,14 +535,44 @@ export default function App() {
     setMessageText('');
   };
 
+  const handleJailPay = () => {
+    if (!currentRoom) return;
+    socket.emit('jailChoice', { roomCode: currentRoom, pay: true });
+    socket.emit('jail_choice', { roomCode: currentRoom, pay: true });
+    setJailModal(null);
+  };
+
+  const handleJailSkip = () => {
+    if (!currentRoom) return;
+    socket.emit('jailChoice', { roomCode: currentRoom, pay: false });
+    socket.emit('jail_choice', { roomCode: currentRoom, pay: false });
+    setJailModal(null);
+  };
+
+  const handleCardOk = () => {
+    if (!currentRoom) return;
+    setCardModal(null);
+    socket.emit('cardAck', { roomCode: currentRoom });
+    socket.emit('card_ack', { roomCode: currentRoom });
+  };
+
+  const handlePaymentOk = () => {
+    setPaymentQueue((prev) => prev.slice(1));
+  };
+
   const isMyTurn = Boolean(gameState?.currentPlayerId && socketId && gameState.currentPlayerId === socketId);
   const currentPlayer = gameState?.players?.find((p) => p.id === gameState?.currentPlayerId) || null;
 
   const isMeBankrupt = Boolean(me?.isBankrupt);
+  const isMeAnimating = Boolean(socketId && isAnimating(socketId));
 
   const canBuyNow = Boolean(
     !gameOver &&
     !isMeBankrupt &&
+    !isMeAnimating &&
+    !cardModal &&
+    !jailModal &&
+    !paymentModal &&
     gameState?.phase === 'awaiting_buy' &&
     gameState?.pending?.playerId === socketId &&
     isMyTurn
@@ -502,6 +735,173 @@ export default function App() {
 
         {isPlaying && gameState && (
           <div className="game-shell">
+            {/* Payment modal */}
+            {paymentModal && !cardModal && !jailModal && (
+              <div
+                style={{
+                  position: 'fixed',
+                  inset: 0,
+                  background: 'rgba(2,6,23,0.72)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  zIndex: 9999,
+                  padding: 16,
+                }}
+              >
+                <div
+                  style={{
+                    width: 'min(620px, 100%)',
+                    borderRadius: 16,
+                    border: '1px solid rgba(255,255,255,0.12)',
+                    background: 'rgba(2,6,23,0.92)',
+                    boxShadow: '0 30px 80px rgba(0,0,0,0.65)',
+                    padding: 18,
+                    textAlign: 'center',
+                  }}
+                >
+                  <div style={{ fontWeight: 950, fontSize: 20 }}>
+                    {formatPaymentTitle(paymentModal)}
+                  </div>
+
+                  <div style={{ marginTop: 10, fontSize: 15, lineHeight: 1.55, opacity: 0.98 }}>
+                    {formatPaymentBody(paymentModal)}
+                  </div>
+
+                  <div style={{ marginTop: 16, display: 'flex', justifyContent: 'center' }}>
+                    <button
+                      type="button"
+                      onClick={handlePaymentOk}
+                      style={{ width: 'auto', padding: '10px 18px', marginTop: 0 }}
+                    >
+                      {formatPaymentButton(paymentModal)}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Card modal */}
+            {cardModal && (
+              <div
+                style={{
+                  position: 'fixed',
+                  inset: 0,
+                  background: 'rgba(2,6,23,0.72)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  zIndex: 9998,
+                  padding: 16,
+                }}
+              >
+                <div
+                  style={{
+                    width: 'min(620px, 100%)',
+                    borderRadius: 16,
+                    border: '1px solid rgba(255,255,255,0.12)',
+                    background: 'rgba(2,6,23,0.92)',
+                    boxShadow: '0 30px 80px rgba(0,0,0,0.65)',
+                    padding: 18,
+                    textAlign: 'center',
+                  }}
+                >
+                  <div style={{ fontWeight: 950, fontSize: 20, letterSpacing: 0.2 }}>
+                    {cardModal.deckLabel || 'Karta'}
+                  </div>
+
+                  <div style={{ marginTop: 10, fontSize: 15, lineHeight: 1.55, opacity: 0.98 }}>
+                    {cardModal.text}
+                  </div>
+
+                  {cardModal.nickname && (
+                    <div style={{ marginTop: 14, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, opacity: 0.9 }}>
+                      <div
+                        style={{
+                          width: 12,
+                          height: 12,
+                          borderRadius: 999,
+                          background: COLOR_HEX[cardModal.colorKey || 'blue'] || '#94a3b8',
+                          border: '1px solid rgba(255,255,255,0.35)',
+                        }}
+                      />
+                      <div style={{ fontSize: 13 }}>
+                        Gracz: <strong>{cardModal.nickname}</strong>
+                      </div>
+                    </div>
+                  )}
+
+                  <div style={{ marginTop: 16, display: 'flex', justifyContent: 'center' }}>
+                    <button
+                      type="button"
+                      onClick={handleCardOk}
+                      style={{ width: 'auto', padding: '10px 18px', marginTop: 0 }}
+                    >
+                      OK
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Jail modal */}
+            {jailModal && (
+              <div
+                style={{
+                  position: 'fixed',
+                  inset: 0,
+                  background: 'rgba(2,6,23,0.72)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  zIndex: 9999,
+                  padding: 16,
+                }}
+              >
+                <div
+                  style={{
+                    width: 'min(680px, 100%)',
+                    borderRadius: 16,
+                    border: '1px solid rgba(255,255,255,0.12)',
+                    background: 'rgba(2,6,23,0.92)',
+                    boxShadow: '0 30px 80px rgba(0,0,0,0.65)',
+                    padding: 16,
+                    textAlign: 'center',
+                  }}
+                >
+                  <div style={{ fontWeight: 950, fontSize: 18 }}>
+                    Więzienie
+                  </div>
+
+                  <div style={{ marginTop: 10, fontSize: 14, lineHeight: 1.45, opacity: 0.95 }}>
+                    Wybierz opcję:
+                    <div style={{ marginTop: 8, opacity: 0.9 }}>
+                      • Zapłać <strong>{jailModal.fine}</strong> i wyjdź z więzienia
+                      <br />
+                      • Pomiń turę
+                    </div>
+                  </div>
+
+                  <div style={{ marginTop: 14, display: 'flex', gap: 10, justifyContent: 'center', flexWrap: 'wrap' }}>
+                    <button
+                      type="button"
+                      onClick={handleJailPay}
+                      style={{ width: 'auto', padding: '10px 14px', marginTop: 0 }}
+                    >
+                      Zapłać {jailModal.fine}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleJailSkip}
+                      style={{ width: 'auto', padding: '10px 14px', marginTop: 0, background: '#334155' }}
+                    >
+                      Pomiń turę
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
             {/* Winner modal */}
             {gameOver && showWinnerModal && (
               <div
@@ -512,7 +912,7 @@ export default function App() {
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
-                  zIndex: 9999,
+                  zIndex: 9997,
                   padding: 16,
                 }}
               >
@@ -639,6 +1039,7 @@ export default function App() {
                         </div>
                         <div className="player-card-meta">Saldo: {p.balance}</div>
                         <div className="player-card-meta">Pole: {animatedPositions[p.id] ?? p.position}</div>
+                        {p.inJail ? <div className="player-card-meta">Status: WIĘZIENIE</div> : null}
                         {p.isBankrupt ? <div className="player-card-meta">Status: BANKRUT</div> : null}
                       </div>
                     );
@@ -666,7 +1067,16 @@ export default function App() {
                   <div className="controls-row">
                     <button
                       onClick={handleRollDice}
-                      disabled={!isMyTurn || gameOver || isMeBankrupt || gameState.phase === 'awaiting_buy'}
+                      disabled={
+                        !isMyTurn ||
+                        gameOver ||
+                        isMeBankrupt ||
+                        isMeAnimating ||
+                        Boolean(cardModal) ||
+                        Boolean(jailModal) ||
+                        Boolean(paymentModal) ||
+                        gameState.phase !== 'awaiting_roll'
+                      }
                       type="button"
                     >
                       Rzuć kośćmi
