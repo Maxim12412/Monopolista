@@ -3,6 +3,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
+const mongoose = require('mongoose');
 
 const app = express();
 app.use(cors());
@@ -14,11 +15,143 @@ const io = new Server(server, {
   cors: { origin: true, methods: ['GET', 'POST'], credentials: true },
 });
 
-// Player colors
+// ===== MongoDB (persistence) =====
+const MONGODB_URI = process.env.MONGODB_URI || '';
+
+const RoomStateSchema = new mongoose.Schema(
+  {
+    roomCode: { type: String, unique: true, index: true },
+    data: { type: mongoose.Schema.Types.Mixed, default: {} },
+  },
+  { timestamps: true }
+);
+
+const RoomState = mongoose.model('RoomState', RoomStateSchema);
+
+async function connectMongo() {
+  if (!MONGODB_URI) {
+    console.warn('[MongoDB] MONGODB_URI is missing. Persistence is disabled.');
+    return;
+  }
+  try {
+    await mongoose.connect(MONGODB_URI, { serverSelectionTimeoutMS: 8000 });
+    console.log('[MongoDB] Connected');
+  } catch (e) {
+    console.error('[MongoDB] Connection failed:', e?.message || e);
+  }
+}
+
+function isMongoReady() {
+  return mongoose.connection?.readyState === 1;
+}
+
+function safeClone(obj) {
+  return JSON.parse(JSON.stringify(obj));
+}
+
+function roomToPersisted(room) {
+  return {
+    hostId: room.hostId,
+    readyById: room.readyById,
+    players: (room.players || []).map((p) => ({
+      id: p.id,
+      nickname: p.nickname,
+      colorKey: p.colorKey,
+      position: p.position,
+      balance: p.balance,
+      properties: p.properties || [],
+      isBankrupt: Boolean(p.isBankrupt),
+      inJail: Boolean(p.inJail),
+      jailTurnsLeft: Number(p.jailTurnsLeft || 0),
+      isDisconnected: Boolean(p.isDisconnected),
+      disconnectedAt: p.disconnectedAt ? Number(p.disconnectedAt) : null,
+    })),
+    status: room.status,
+    currentPlayerIndex: room.currentPlayerIndex,
+    phase: room.phase,
+    pending: room.pending,
+    gameOver: Boolean(room.gameOver),
+    winnerId: room.winnerId || null,
+    board: room.board,
+    chanceDeck: room.chanceDeck || [],
+    chancePos: room.chancePos || 0,
+    communityDeck: room.communityDeck || [],
+    communityPos: room.communityPos || 0,
+    logHistory: room.logHistory || [],
+  };
+}
+
+function persistedToRoom(data) {
+  const room = {
+    hostId: data.hostId || null,
+    readyById: data.readyById || {},
+    players: Array.isArray(data.players) ? data.players : [],
+    status: data.status || 'waiting',
+    currentPlayerIndex: Number.isFinite(data.currentPlayerIndex) ? data.currentPlayerIndex : 0,
+    board: Array.isArray(data.board) ? data.board : [],
+    phase: data.phase || 'awaiting_roll',
+    pending: data.pending || null,
+    gameOver: Boolean(data.gameOver),
+    winnerId: data.winnerId || null,
+    chanceDeck: Array.isArray(data.chanceDeck) ? data.chanceDeck : [],
+    chancePos: Number.isFinite(data.chancePos) ? data.chancePos : 0,
+    communityDeck: Array.isArray(data.communityDeck) ? data.communityDeck : [],
+    communityPos: Number.isFinite(data.communityPos) ? data.communityPos : 0,
+    logHistory: Array.isArray(data.logHistory) ? data.logHistory : [],
+  };
+  return room;
+}
+
+async function saveRoomNow(roomCode) {
+  if (!isMongoReady()) return;
+  const room = rooms[roomCode];
+  if (!room) return;
+
+  try {
+    const data = roomToPersisted(room);
+    await RoomState.updateOne(
+      { roomCode },
+      { $set: { roomCode, data } },
+      { upsert: true }
+    );
+  } catch (e) {
+    console.error('[MongoDB] Save failed:', e?.message || e);
+  }
+}
+
+function scheduleSave(roomCode) {
+  const room = rooms[roomCode];
+  if (!room) return;
+  if (!isMongoReady()) return;
+
+  if (room._saveTimer) return;
+  room._saveTimer = setTimeout(async () => {
+    room._saveTimer = null;
+    await saveRoomNow(roomCode);
+  }, 400);
+}
+
+async function loadRoomFromDb(roomCode) {
+  if (!isMongoReady()) return null;
+  const doc = await RoomState.findOne({ roomCode }).lean();
+  if (!doc || !doc.data) return null;
+  return persistedToRoom(doc.data);
+}
+
+async function deleteRoomFromDb(roomCode) {
+  if (!isMongoReady()) return;
+  try {
+    await RoomState.deleteOne({ roomCode });
+  } catch (e) {
+    console.error('[MongoDB] Delete failed:', e?.message || e);
+  }
+}
+
+// ===== Player colors =====
 const PLAYER_COLORS = ['blue', 'yellow', 'red', 'green'];
 
 function pickNextColor(room) {
-  const used = new Set(room.players.map((p) => p.colorKey));
+  const used = new Set((room.players || []).map((p) => p.colorKey));
   const next = PLAYER_COLORS.find((c) => !used.has(c));
   return next || 'blue';
 }
@@ -89,7 +222,7 @@ const BOARD_TILES = [
 const JAIL_TILE_ID = 10;
 const JAIL_FINE = 50;
 
-// ===== Cards (Szansa / Kasa społeczna) =====
+// ===== Cards =====
 const CHANCE_CARDS = [
   { id: 'ch_1', text: 'Otrzymujesz +200.', effect: { type: 'money', amount: 200 } },
   { id: 'ch_2', text: 'Otrzymujesz +25.', effect: { type: 'money', amount: 25 } },
@@ -137,6 +270,8 @@ function createPlayer(socketId, nickname, colorKey) {
     isBankrupt: false,
     inJail: false,
     jailTurnsLeft: 0,
+    isDisconnected: false,
+    disconnectedAt: null,
   };
 }
 
@@ -155,8 +290,16 @@ function emitRoomUpdate(roomCode) {
   io.to(roomCode).emit('roomUpdate', snapshotRoom(room));
 }
 
-function emitLog(roomCode, text) {
+function appendLog(roomCode, text) {
+  const room = rooms[roomCode];
+  if (!room) return;
+
+  if (!Array.isArray(room.logHistory)) room.logHistory = [];
+  room.logHistory.push({ ts: Date.now(), text });
+  if (room.logHistory.length > 250) room.logHistory = room.logHistory.slice(-250);
+
   io.to(roomCode).emit('gameLogEvent', { ts: Date.now(), text });
+  scheduleSave(roomCode);
 }
 
 function emitToastToPlayer(playerId, payload) {
@@ -193,10 +336,13 @@ function emitGameState(roomCode) {
       isBankrupt: Boolean(p.isBankrupt),
       inJail: Boolean(p.inJail),
       jailTurnsLeft: Number(p.jailTurnsLeft || 0),
+      isDisconnected: Boolean(p.isDisconnected),
     })),
     currentPlayerId: current ? current.id : null,
     board: room.board,
   });
+
+  scheduleSave(roomCode);
 }
 
 function allReady(room) {
@@ -209,6 +355,7 @@ function getPlayerById(room, playerId) {
 }
 
 function getActivePlayers(room) {
+  // IMPORTANT: disconnected players are still "active" (do not end game)
   return room.players.filter((p) => !p.isBankrupt);
 }
 
@@ -249,12 +396,18 @@ function computeRent(room, tile, diceSum) {
   return 0;
 }
 
-// ===== Turn helpers (skip bankrupt players) =====
+// ===== Turn helpers =====
 function ensureCurrentIsActive(room) {
   if (room.players.length === 0) return;
+
   const triesMax = room.players.length;
   let tries = 0;
-  while (tries < triesMax && room.players[room.currentPlayerIndex]?.isBankrupt) {
+
+  // Skip bankrupt OR disconnected players to avoid stuck turns
+  while (
+    tries < triesMax &&
+    (room.players[room.currentPlayerIndex]?.isBankrupt || room.players[room.currentPlayerIndex]?.isDisconnected)
+  ) {
     room.currentPlayerIndex = (room.currentPlayerIndex + 1) % room.players.length;
     tries += 1;
   }
@@ -284,7 +437,7 @@ function checkWinner(roomCode) {
     room.phase = 'awaiting_roll';
     room.pending = null;
 
-    emitLog(roomCode, `Zwycięzca: ${active[0].nickname}.`);
+    appendLog(roomCode, `Zwycięzca: ${active[0].nickname}.`);
     emitGameState(roomCode);
   }
 }
@@ -305,7 +458,7 @@ function handleBankruptcy(roomCode, playerId) {
 
   releasePropertiesToBank(room, pl.id);
 
-  emitLog(roomCode, `Gracz ${pl.nickname} zbankrutował.`);
+  appendLog(roomCode, `Gracz ${pl.nickname} zbankrutował.`);
   emitToastToPlayer(pl.id, { type: 'err', text: 'Bankructwo!' });
 
   ensureCurrentIsActive(room);
@@ -319,7 +472,7 @@ function handleBankruptcy(roomCode, playerId) {
   return true;
 }
 
-// ===== Movement paths (for animation) =====
+// ===== Movement paths (animation) =====
 function buildForwardPath(startPos, steps, len) {
   const path = [];
   let pos = startPos;
@@ -351,7 +504,7 @@ function buildPathToForward(startPos, targetPos, len) {
   return path;
 }
 
-// ===== Cards / Jail helpers =====
+// ===== Cards / Jail =====
 function initDecks(room) {
   room.chanceDeck = shuffleArray(CHANCE_CARDS);
   room.chancePos = 0;
@@ -385,7 +538,7 @@ function sendToJail(roomCode, room, player, reason = 'jail') {
 
   io.to(roomCode).emit('playerMovePath', { playerId: player.id, path: [JAIL_TILE_ID], reason });
 
-  emitLog(roomCode, `${player.nickname} idzie do więzienia.`);
+  appendLog(roomCode, `${player.nickname} idzie do więzienia.`);
   emitToastToPlayer(player.id, { type: 'err', text: 'Więzienie' });
 }
 
@@ -400,14 +553,13 @@ function maybePromptJail(roomCode, room, player) {
   io.to(player.id).emit('jailPrompt', { playerId: player.id, fine: JAIL_FINE });
   io.to(player.id).emit('jail_prompt', { playerId: player.id, fine: JAIL_FINE });
 
-  emitLog(roomCode, `${player.nickname} jest w więzieniu: wybór (zapłać ${JAIL_FINE} lub pomiń turę).`);
+  appendLog(roomCode, `${player.nickname} jest w więzieniu: wybór (zapłać ${JAIL_FINE} lub pomiń turę).`);
   return true;
 }
 
 function resolveLanding(roomCode, room, player, diceSum, fromCard = false) {
   const tile = room.board[player.position];
 
-  // GO TO JAIL tile
   if (tile.type === 'go_to_jail') {
     sendToJail(roomCode, room, player, 'tile');
 
@@ -420,19 +572,14 @@ function resolveLanding(roomCode, room, player, diceSum, fromCard = false) {
     return { phase: 'awaiting_roll', endedTurn: true };
   }
 
-  // TAX
   if (tile.type === 'tax' && typeof tile.amount === 'number') {
     const taxAmount = Number(tile.amount);
     player.balance -= taxAmount;
 
-    emitLog(roomCode, `${player.nickname} zapłacił podatek ${taxAmount} na polu "${tile.name}".`);
+    appendLog(roomCode, `${player.nickname} zapłacił podatek ${taxAmount} na polu "${tile.name}".`);
     emitToastToPlayer(player.id, { type: 'err', text: `Podatek: -${taxAmount} (${tile.name})` });
 
-    emitPaymentPromptToPlayer(player.id, {
-      type: 'tax',
-      amount: taxAmount,
-      tileName: tile.name,
-    });
+    emitPaymentPromptToPlayer(player.id, { type: 'tax', amount: taxAmount, tileName: tile.name });
 
     if (handleBankruptcy(roomCode, player.id)) {
       advanceTurn(room);
@@ -441,7 +588,6 @@ function resolveLanding(roomCode, room, player, diceSum, fromCard = false) {
     }
   }
 
-  // RENT
   if (isBuyable(tile) && tile.ownerId && tile.ownerId !== player.id) {
     const owner = getPlayerById(room, tile.ownerId);
     const rent = computeRent(room, tile, diceSum);
@@ -450,7 +596,7 @@ function resolveLanding(roomCode, room, player, diceSum, fromCard = false) {
       player.balance -= rent;
       owner.balance += rent;
 
-      emitLog(roomCode, `${player.nickname} zapłacił czynsz ${rent} dla ${owner.nickname} (${tile.name}).`);
+      appendLog(roomCode, `${player.nickname} zapłacił czynsz ${rent} dla ${owner.nickname} (${tile.name}).`);
       emitToastToPlayer(player.id, { type: 'err', text: `Czynsz: -${rent} → ${owner.nickname} (${tile.name})` });
       emitToastToPlayer(owner.id, { type: 'ok', text: `Czynsz: +${rent} od ${player.nickname} (${tile.name})` });
 
@@ -467,18 +613,17 @@ function resolveLanding(roomCode, room, player, diceSum, fromCard = false) {
         return { phase: 'awaiting_roll', endedTurn: true };
       }
     } else {
-      emitLog(roomCode, `Nie udało się naliczyć czynszu dla pola "${tile.name}".`);
+      appendLog(roomCode, `Nie udało się naliczyć czynszu dla pola "${tile.name}".`);
     }
   }
 
-  // CARDS: draw card and WAIT for ack
   if (!fromCard && (tile.type === 'random' || tile.type === 'chest')) {
     const deckType = tile.type === 'random' ? 'chance' : 'community';
     const deckLabel = deckType === 'chance' ? 'Szansa' : 'Kasa społeczna';
 
     const card = drawCard(room, deckType);
     if (card) {
-      emitLog(roomCode, `${player.nickname} wylosował kartę: ${deckLabel} — "${card.text}".`);
+      appendLog(roomCode, `${player.nickname} wylosował kartę: ${deckLabel} — "${card.text}".`);
 
       room.phase = 'awaiting_card_ack';
       room.pending = {
@@ -515,7 +660,6 @@ function resolveLanding(roomCode, room, player, diceSum, fromCard = false) {
 
   emitGameState(roomCode);
 
-  // Buy phase if unowned
   if (isBuyable(tile) && !tile.ownerId && typeof tile.price === 'number') {
     room.phase = 'awaiting_buy';
     room.pending = { playerId: player.id, tileId: tile.id };
@@ -523,7 +667,6 @@ function resolveLanding(roomCode, room, player, diceSum, fromCard = false) {
     return { phase: 'awaiting_buy', endedTurn: false };
   }
 
-  // End turn
   room.phase = 'awaiting_roll';
   room.pending = null;
   advanceTurn(room);
@@ -537,7 +680,7 @@ function applyCardEffectAfterAck(roomCode, room, player, pendingCard) {
   const eff = card?.effect || null;
 
   if (!eff || !eff.type) {
-    emitLog(roomCode, 'Efekt: brak.');
+    appendLog(roomCode, 'Efekt: brak.');
     room.phase = 'awaiting_roll';
     room.pending = null;
     advanceTurn(room);
@@ -550,17 +693,12 @@ function applyCardEffectAfterAck(roomCode, room, player, pendingCard) {
     player.balance += amt;
 
     if (amt >= 0) {
-      emitLog(roomCode, `Efekt: ${player.nickname} otrzymał +${amt}.`);
+      appendLog(roomCode, `Efekt: ${player.nickname} otrzymał +${amt}.`);
       emitToastToPlayer(player.id, { type: 'ok', text: `+${amt}` });
     } else {
-      emitLog(roomCode, `Efekt: ${player.nickname} zapłacił ${Math.abs(amt)}.`);
+      appendLog(roomCode, `Efekt: ${player.nickname} zapłacił ${Math.abs(amt)}.`);
       emitToastToPlayer(player.id, { type: 'err', text: `-${Math.abs(amt)}` });
-
-      emitPaymentPromptToPlayer(player.id, {
-        type: 'fee',
-        amount: Math.abs(amt),
-        label: 'Opłata',
-      });
+      emitPaymentPromptToPlayer(player.id, { type: 'fee', amount: Math.abs(amt), label: 'Opłata' });
     }
 
     if (handleBankruptcy(roomCode, player.id)) {
@@ -580,7 +718,7 @@ function applyCardEffectAfterAck(roomCode, room, player, pendingCard) {
   }
 
   if (eff.type === 'goToJail') {
-    emitLog(roomCode, `Efekt: ${player.nickname} idzie do więzienia.`);
+    appendLog(roomCode, `Efekt: ${player.nickname} idzie do więzienia.`);
     sendToJail(roomCode, room, player, 'card');
 
     room.phase = 'awaiting_roll';
@@ -605,8 +743,7 @@ function applyCardEffectAfterAck(roomCode, room, player, pendingCard) {
       io.to(roomCode).emit('playerMovePath', { playerId: player.id, path, reason: 'card' });
     }
 
-    emitLog(roomCode, `Efekt: ${player.nickname} przesuwa się o ${steps} pola.`);
-
+    appendLog(roomCode, `Efekt: ${player.nickname} przesuwa się o ${steps} pola.`);
     return resolveLanding(roomCode, room, player, diceSum, true);
   }
 
@@ -620,19 +757,18 @@ function applyCardEffectAfterAck(roomCode, room, player, pendingCard) {
 
     if (target < startPos) {
       player.balance += 200;
-      emitLog(roomCode, `${player.nickname} przeszedł przez START i otrzymał +200.`);
+      appendLog(roomCode, `${player.nickname} przeszedł przez START i otrzymał +200.`);
       emitToastToPlayer(player.id, { type: 'ok', text: 'START: +200' });
     }
 
     player.position = target;
     io.to(roomCode).emit('playerMovePath', { playerId: player.id, path: path.length ? path : [target], reason: 'card' });
 
-    emitLog(roomCode, `Efekt: ${player.nickname} idzie na pole: ${room.board[target]?.name || target}.`);
-
+    appendLog(roomCode, `Efekt: ${player.nickname} idzie na pole: ${room.board[target]?.name || target}.`);
     return resolveLanding(roomCode, room, player, diceSum, true);
   }
 
-  emitLog(roomCode, 'Efekt: nieznany.');
+  appendLog(roomCode, 'Efekt: nieznany.');
   room.phase = 'awaiting_roll';
   room.pending = null;
   advanceTurn(room);
@@ -658,14 +794,45 @@ function resetGame(roomCode) {
     p.isBankrupt = false;
     p.inJail = false;
     p.jailTurnsLeft = 0;
+    p.isDisconnected = false;
+    p.disconnectedAt = null;
   });
 
   initDecks(room);
   ensureCurrentIsActive(room);
 
   io.to(roomCode).emit('gameReset');
-  emitLog(roomCode, `Nowa gra rozpoczęta. Pierwszy ruch: ${room.players[room.currentPlayerIndex]?.nickname || '-'}.`);
+  appendLog(roomCode, `Nowa gra rozpoczęta. Pierwszy ruch: ${room.players[room.currentPlayerIndex]?.nickname || '-'}.`);
   emitGameState(roomCode);
+  scheduleSave(roomCode);
+}
+
+// ===== Rebind socket id on rejoin =====
+function rebindPlayerId(room, oldId, newId) {
+  if (!room || !oldId || !newId) return;
+
+  room.players.forEach((p) => {
+    if (p.id === oldId) p.id = newId;
+  });
+
+  if (room.hostId === oldId) room.hostId = newId;
+  if (room.winnerId === oldId) room.winnerId = newId;
+
+  if (room.readyById) {
+    const val = room.readyById[oldId];
+    delete room.readyById[oldId];
+    room.readyById[newId] = val;
+  }
+
+  if (Array.isArray(room.board)) {
+    room.board.forEach((t) => {
+      if (t.ownerId === oldId) t.ownerId = newId;
+    });
+  }
+
+  if (room.pending && room.pending.playerId === oldId) {
+    room.pending.playerId = newId;
+  }
 }
 
 // ===== Socket.IO =====
@@ -688,35 +855,76 @@ io.on('connection', (socket) => {
         chancePos: 0,
         communityDeck: [],
         communityPos: 0,
+        logHistory: [],
       };
 
       const colorKey = pickNextColor(room);
       room.players.push(createPlayer(socket.id, nickname, colorKey));
       initDecks(room);
-      rooms[roomCode] = room;
 
+      rooms[roomCode] = room;
       socket.join(roomCode);
+
       callback?.({ ok: true, roomCode, room: snapshotRoom(room) });
 
       emitRoomUpdate(roomCode);
-      emitLog(roomCode, `Pokój utworzony. Host: ${nickname}.`);
+      appendLog(roomCode, `Pokój utworzony. Host: ${nickname}.`);
+      emitGameState(roomCode);
+      scheduleSave(roomCode);
     } catch (e) {
       callback?.({ ok: false, error: 'SERVER_ERROR' });
     }
   });
 
-  socket.on('joinRoom', ({ roomCode, nickname }, callback) => {
+  socket.on('joinRoom', async ({ roomCode, nickname }, callback) => {
     try {
       roomCode = String(roomCode || '').toUpperCase();
-      const room = rooms[roomCode];
 
+      if (!rooms[roomCode] && isMongoReady()) {
+        const loaded = await loadRoomFromDb(roomCode);
+        if (loaded) rooms[roomCode] = loaded;
+      }
+
+      const room = rooms[roomCode];
       if (!room) return callback?.({ ok: false, error: 'ROOM_NOT_FOUND' });
-      if (room.status !== 'waiting') return callback?.({ ok: false, error: 'GAME_ALREADY_STARTED' });
+
+      // If playing: allow rejoin only by nickname existing in room
+      if (room.status !== 'waiting') {
+        const existingByNick = room.players.find((p) => p.nickname === nickname) || null;
+        if (!existingByNick) return callback?.({ ok: false, error: 'GAME_ALREADY_STARTED' });
+
+        const oldId = existingByNick.id;
+        rebindPlayerId(room, oldId, socket.id);
+
+        // Mark as connected again
+        const nowPlayer = room.players.find((p) => p.id === socket.id) || null;
+        if (nowPlayer) {
+          nowPlayer.isDisconnected = false;
+          nowPlayer.disconnectedAt = null;
+        }
+
+        socket.join(roomCode);
+
+        callback?.({ ok: true, roomCode, room: snapshotRoom(room) });
+        socket.emit('logHistory', room.logHistory || []);
+
+        emitRoomUpdate(roomCode);
+        emitGameState(roomCode);
+        appendLog(roomCode, `Gracz ${nickname} wrócił do gry.`);
+        scheduleSave(roomCode);
+        return;
+      }
+
+      // Waiting room rules
       if (room.players.length >= 6) return callback?.({ ok: false, error: 'ROOM_FULL' });
 
       if (room.players.some((p) => p.id === socket.id)) {
         socket.join(roomCode);
-        return callback?.({ ok: true, roomCode, room: snapshotRoom(room) });
+        callback?.({ ok: true, roomCode, room: snapshotRoom(room) });
+        socket.emit('logHistory', room.logHistory || []);
+        emitRoomUpdate(roomCode);
+        emitGameState(roomCode);
+        return;
       }
 
       if (room.players.some((p) => p.nickname === nickname)) {
@@ -730,8 +938,11 @@ io.on('connection', (socket) => {
       socket.join(roomCode);
       callback?.({ ok: true, roomCode, room: snapshotRoom(room) });
 
+      socket.emit('logHistory', room.logHistory || []);
       emitRoomUpdate(roomCode);
-      emitLog(roomCode, `Gracz ${nickname} dołączył do pokoju.`);
+      appendLog(roomCode, `Gracz ${nickname} dołączył do pokoju.`);
+      emitGameState(roomCode);
+      scheduleSave(roomCode);
     } catch (e) {
       callback?.({ ok: false, error: 'SERVER_ERROR' });
     }
@@ -747,8 +958,9 @@ io.on('connection', (socket) => {
 
     room.readyById[socket.id] = Boolean(ready);
     emitRoomUpdate(roomCode);
-    emitLog(roomCode, `${player.nickname} jest ${room.readyById[socket.id] ? 'gotowy' : 'nie gotowy'}.`);
+    appendLog(roomCode, `${player.nickname} jest ${room.readyById[socket.id] ? 'gotowy' : 'nie gotowy'}.`);
     callback?.({ ok: true });
+    scheduleSave(roomCode);
   });
 
   socket.on('startGame', ({ roomCode }, callback) => {
@@ -756,11 +968,11 @@ io.on('connection', (socket) => {
     if (!room) return callback?.({ ok: false, error: 'ROOM_NOT_FOUND' });
     if (room.status !== 'waiting') return callback?.({ ok: false, error: 'ALREADY_PLAYING' });
     if (socket.id !== room.hostId) {
-      emitLog(roomCode, 'Tylko host może rozpocząć grę.');
+      appendLog(roomCode, 'Tylko host może rozpocząć grę.');
       return callback?.({ ok: false, error: 'NOT_HOST' });
     }
     if (!allReady(room)) {
-      emitLog(roomCode, 'Nie wszyscy gracze są gotowi (minimum 2 graczy).');
+      appendLog(roomCode, 'Nie wszyscy gracze są gotowi (minimum 2 graczy).');
       return callback?.({ ok: false, error: 'NOT_READY' });
     }
 
@@ -771,6 +983,7 @@ io.on('connection', (socket) => {
     room.currentPlayerIndex = 0;
     room.gameOver = false;
     room.winnerId = null;
+    room.logHistory = room.logHistory || [];
 
     room.players.forEach((p) => {
       p.position = 0;
@@ -779,6 +992,8 @@ io.on('connection', (socket) => {
       p.isBankrupt = false;
       p.inJail = false;
       p.jailTurnsLeft = 0;
+      p.isDisconnected = false;
+      p.disconnectedAt = null;
     });
 
     initDecks(room);
@@ -786,8 +1001,9 @@ io.on('connection', (socket) => {
 
     emitRoomUpdate(roomCode);
     emitGameState(roomCode);
-    emitLog(roomCode, `Gra rozpoczęta. Pierwszy ruch: ${room.players[room.currentPlayerIndex].nickname}.`);
+    appendLog(roomCode, `Gra rozpoczęta. Pierwszy ruch: ${room.players[room.currentPlayerIndex].nickname}.`);
     callback?.({ ok: true });
+    scheduleSave(roomCode);
   });
 
   socket.on('restartGame', ({ roomCode }, callback) => {
@@ -798,6 +1014,7 @@ io.on('connection', (socket) => {
 
     resetGame(roomCode);
     callback?.({ ok: true });
+    scheduleSave(roomCode);
   });
 
   socket.on('sendMessage', ({ roomCode, nickname, message }) => {
@@ -816,6 +1033,7 @@ io.on('connection', (socket) => {
     if (!currentPlayer) return callback?.({ ok: false, error: 'NO_CURRENT_PLAYER' });
     if (currentPlayer.id !== socket.id) return callback?.({ ok: false, error: 'NOT_YOUR_TURN' });
     if (currentPlayer.isBankrupt) return callback?.({ ok: false, error: 'BANKRUPT' });
+    if (currentPlayer.isDisconnected) return callback?.({ ok: false, error: 'DISCONNECTED' });
 
     if (room.phase !== 'awaiting_jail_choice' || !room.pending || room.pending.type !== 'jail' || room.pending.playerId !== socket.id) {
       return callback?.({ ok: false, error: 'NOT_IN_JAIL_CHOICE' });
@@ -828,14 +1046,9 @@ io.on('connection', (socket) => {
       currentPlayer.inJail = false;
       currentPlayer.jailTurnsLeft = 0;
 
-      emitLog(roomCode, `${currentPlayer.nickname} zapłacił ${fine} i wychodzi z więzienia.`);
+      appendLog(roomCode, `${currentPlayer.nickname} zapłacił ${fine} i wychodzi z więzienia.`);
       emitToastToPlayer(currentPlayer.id, { type: 'err', text: `Więzienie: -${fine}` });
-
-      emitPaymentPromptToPlayer(currentPlayer.id, {
-        type: 'fee',
-        amount: fine,
-        label: 'Więzienie',
-      });
+      emitPaymentPromptToPlayer(currentPlayer.id, { type: 'fee', amount: fine, label: 'Więzienie' });
 
       room.phase = 'awaiting_roll';
       room.pending = null;
@@ -846,31 +1059,34 @@ io.on('connection', (socket) => {
         advanceTurn(room);
         emitGameState(roomCode);
         checkWinner(roomCode);
+        scheduleSave(roomCode);
         return callback?.({ ok: true, phase: 'awaiting_roll' });
       }
 
+      scheduleSave(roomCode);
       return callback?.({ ok: true, phase: 'awaiting_roll' });
     }
 
     currentPlayer.jailTurnsLeft = Math.max(0, Number(currentPlayer.jailTurnsLeft || 0) - 1);
-    emitLog(roomCode, `${currentPlayer.nickname} zostaje w więzieniu i pomija turę.`);
+    appendLog(roomCode, `${currentPlayer.nickname} zostaje w więzieniu i pomija turę.`);
 
     if (currentPlayer.jailTurnsLeft <= 0) {
       currentPlayer.inJail = false;
-      emitLog(roomCode, `${currentPlayer.nickname} wychodzi z więzienia.`);
+      appendLog(roomCode, `${currentPlayer.nickname} wychodzi z więzienia.`);
     }
 
     room.phase = 'awaiting_roll';
     room.pending = null;
     advanceTurn(room);
     emitGameState(roomCode);
+    scheduleSave(roomCode);
     callback?.({ ok: true, phase: 'awaiting_roll' });
   }
 
   socket.on('jailChoice', handleJailChoice);
   socket.on('jail_choice', handleJailChoice);
 
-  // Card ack (OK)
+  // Card ack
   function handleCardAck({ roomCode }, callback) {
     const room = rooms[roomCode];
     if (!room || room.status !== 'playing') return callback?.({ ok: false, error: 'NOT_PLAYING' });
@@ -882,15 +1098,17 @@ io.on('connection', (socket) => {
     if (!currentPlayer) return callback?.({ ok: false, error: 'NO_CURRENT_PLAYER' });
     if (currentPlayer.id !== socket.id) return callback?.({ ok: false, error: 'NOT_YOUR_TURN' });
     if (currentPlayer.isBankrupt) return callback?.({ ok: false, error: 'BANKRUPT' });
+    if (currentPlayer.isDisconnected) return callback?.({ ok: false, error: 'DISCONNECTED' });
 
     if (room.phase !== 'awaiting_card_ack' || !room.pending || room.pending.type !== 'card' || room.pending.playerId !== socket.id) {
       return callback?.({ ok: false, error: 'NOT_IN_CARD_ACK' });
     }
 
-    const pendingCard = room.pending;
+    const pendingCard = safeClone(room.pending);
     room.pending = null;
 
     const result = applyCardEffectAfterAck(roomCode, room, currentPlayer, pendingCard);
+    scheduleSave(roomCode);
     return callback?.({ ok: true, phase: result?.phase || room.phase });
   }
 
@@ -907,11 +1125,11 @@ io.on('connection', (socket) => {
     const currentPlayer = room.players[room.currentPlayerIndex];
     if (!currentPlayer) return callback?.({ ok: false, error: 'NO_CURRENT_PLAYER' });
     if (currentPlayer.isBankrupt) return callback?.({ ok: false, error: 'BANKRUPT' });
+    if (currentPlayer.isDisconnected) return callback?.({ ok: false, error: 'DISCONNECTED' });
     if (currentPlayer.id !== socket.id) return callback?.({ ok: false, error: 'NOT_YOUR_TURN' });
 
     if (room.phase !== 'awaiting_roll') return callback?.({ ok: false, error: 'NOT_IN_ROLL_PHASE' });
 
-    // Jail gate
     if (currentPlayer.inJail && currentPlayer.jailTurnsLeft > 0) {
       const prompted = maybePromptJail(roomCode, room, currentPlayer);
       if (prompted) return callback?.({ ok: true, phase: 'awaiting_jail_choice' });
@@ -928,7 +1146,7 @@ io.on('connection', (socket) => {
     if (newPos >= len) {
       newPos = newPos % len;
       currentPlayer.balance += 200;
-      emitLog(roomCode, `${currentPlayer.nickname} przeszedł przez START i otrzymał +200.`);
+      appendLog(roomCode, `${currentPlayer.nickname} przeszedł przez START i otrzymał +200.`);
       emitToastToPlayer(currentPlayer.id, { type: 'ok', text: 'START: +200' });
     }
 
@@ -948,9 +1166,10 @@ io.on('connection', (socket) => {
     const path = buildForwardPath(oldPos, steps, len);
     io.to(roomCode).emit('playerMovePath', { playerId: currentPlayer.id, path, reason: 'dice' });
 
-    emitLog(roomCode, `${currentPlayer.nickname} rzucił ${dice1}+${dice2}=${steps} → ${tile.name}.`);
+    appendLog(roomCode, `${currentPlayer.nickname} rzucił ${dice1}+${dice2}=${steps} → ${tile.name}.`);
 
     const result = resolveLanding(roomCode, room, currentPlayer, steps, false);
+    scheduleSave(roomCode);
     return callback?.({ ok: true, phase: result?.phase || room.phase });
   });
 
@@ -965,6 +1184,7 @@ io.on('connection', (socket) => {
     const currentPlayer = room.players[room.currentPlayerIndex];
     if (!currentPlayer) return callback?.({ ok: false, error: 'NO_CURRENT_PLAYER' });
     if (currentPlayer.isBankrupt) return callback?.({ ok: false, error: 'BANKRUPT' });
+    if (currentPlayer.isDisconnected) return callback?.({ ok: false, error: 'DISCONNECTED' });
     if (currentPlayer.id !== socket.id) return callback?.({ ok: false, error: 'NOT_YOUR_TURN' });
 
     if (room.phase !== 'awaiting_buy' || !room.pending || room.pending.playerId !== socket.id) {
@@ -981,7 +1201,7 @@ io.on('connection', (socket) => {
     currentPlayer.balance -= tile.price;
     currentPlayer.properties.push(tile.id);
 
-    emitLog(roomCode, `${currentPlayer.nickname} kupił ${tile.name} za ${tile.price}.`);
+    appendLog(roomCode, `${currentPlayer.nickname} kupił ${tile.name} za ${tile.price}.`);
     emitToastToPlayer(currentPlayer.id, { type: 'ok', text: `Kupiono: ${tile.name} (-${tile.price})` });
 
     room.phase = 'awaiting_roll';
@@ -989,6 +1209,7 @@ io.on('connection', (socket) => {
     advanceTurn(room);
 
     emitGameState(roomCode);
+    scheduleSave(roomCode);
     callback?.({ ok: true });
   });
 
@@ -1003,13 +1224,14 @@ io.on('connection', (socket) => {
     const currentPlayer = room.players[room.currentPlayerIndex];
     if (!currentPlayer) return callback?.({ ok: false, error: 'NO_CURRENT_PLAYER' });
     if (currentPlayer.isBankrupt) return callback?.({ ok: false, error: 'BANKRUPT' });
+    if (currentPlayer.isDisconnected) return callback?.({ ok: false, error: 'DISCONNECTED' });
     if (currentPlayer.id !== socket.id) return callback?.({ ok: false, error: 'NOT_YOUR_TURN' });
 
     if (room.phase !== 'awaiting_buy' || !room.pending || room.pending.playerId !== socket.id) {
       return callback?.({ ok: false, error: 'NOT_IN_BUY_PHASE' });
     }
 
-    emitLog(roomCode, `${currentPlayer.nickname} nie kupił pola i kończy turę.`);
+    appendLog(roomCode, `${currentPlayer.nickname} nie kupił pola i kończy turę.`);
     emitToastToPlayer(currentPlayer.id, { type: 'ok', text: 'Pominięto zakup' });
 
     room.phase = 'awaiting_roll';
@@ -1017,45 +1239,62 @@ io.on('connection', (socket) => {
     advanceTurn(room);
 
     emitGameState(roomCode);
+    scheduleSave(roomCode);
     callback?.({ ok: true });
   });
 
-  socket.on('disconnect', () => {
+  socket.on('disconnect', async () => {
     for (const roomCode of Object.keys(rooms)) {
       const room = rooms[roomCode];
       const idx = room.players.findIndex((p) => p.id === socket.id);
       if (idx === -1) continue;
 
-      const left = room.players[idx];
+      const pl = room.players[idx];
 
-      if (room.status === 'playing') {
-        releasePropertiesToBank(room, left.id);
+      // WAITING: remove player (classic lobby behavior)
+      if (room.status === 'waiting') {
+        room.players.splice(idx, 1);
+        delete room.readyById[socket.id];
+
+        appendLog(roomCode, `Gracz ${pl.nickname} opuścił pokój.`);
+
+        if (room.players.length === 0) {
+          delete rooms[roomCode];
+          await deleteRoomFromDb(roomCode);
+          return;
+        }
+
+        if (room.hostId === socket.id) {
+          room.hostId = room.players[0].id;
+          room.readyById[room.hostId] = true;
+          appendLog(roomCode, `Nowy host: ${room.players[0].nickname}.`);
+        }
+
+        emitRoomUpdate(roomCode);
+        scheduleSave(roomCode);
+        continue;
       }
 
-      room.players.splice(idx, 1);
-      delete room.readyById[left.id];
+      // PLAYING: do NOT remove player, do NOT release properties
+      pl.isDisconnected = true;
+      pl.disconnectedAt = Date.now();
 
-      emitLog(roomCode, `Gracz ${left.nickname} opuścił grę.`);
+      appendLog(roomCode, `Gracz ${pl.nickname} rozłączył się (gra trwa dalej).`);
 
-      if (room.players.length === 0) {
-        delete rooms[roomCode];
-        return;
+      // If disconnected player was current, advance turn to avoid stuck game
+      const current = room.players[room.currentPlayerIndex] || null;
+      if (current && current.id === pl.id) {
+        room.phase = 'awaiting_roll';
+        room.pending = null;
+        advanceTurn(room);
+        appendLog(roomCode, `Tura została pominięta (gracz rozłączony).`);
+      } else {
+        ensureCurrentIsActive(room);
       }
-
-      if (room.hostId === socket.id) {
-        room.hostId = room.players[0].id;
-        room.readyById[room.hostId] = true;
-        emitLog(roomCode, `Nowy host: ${room.players[0].nickname}.`);
-      }
-
-      if (room.currentPlayerIndex >= room.players.length) room.currentPlayerIndex = 0;
-      ensureCurrentIsActive(room);
 
       emitRoomUpdate(roomCode);
-      if (room.status === 'playing') {
-        emitGameState(roomCode);
-        checkWinner(roomCode);
-      }
+      emitGameState(roomCode);
+      scheduleSave(roomCode);
     }
   });
 });
@@ -1063,4 +1302,8 @@ io.on('connection', (socket) => {
 app.get('/', (req, res) => res.send('Monopolista server is running'));
 
 const PORT = process.env.PORT || 4000;
-server.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+
+(async () => {
+  await connectMongo();
+  server.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+})();
