@@ -24,7 +24,6 @@ const socket = io(SERVER_URL, {
   autoConnect: true,
 });
 
-// Client-side display timers (UI only)
 const TURN_TIMEOUT_MS = 60 * 1000;
 const DISCONNECT_GRACE_MS = 90 * 1000;
 
@@ -33,7 +32,32 @@ const COLOR_HEX = {
   yellow: '#FACC15',
   red: '#EF4444',
   green: '#22C55E',
+  pink: '#EC4899',
 };
+
+const TILE_LABEL_OVERRIDES = {
+  2: 'Kasa\nspołeczna',
+  17: 'Kasa\nspołeczna',
+  33: 'Kasa\nspołeczna',
+
+  4: 'Podatek\ndochodowy',
+  38: 'Domiar\npodatkowy',
+
+  20: 'Bezpłatny\nparking',
+  30: 'Idź do\nwięzienia',
+  10: 'Więzienie\n/ tylko z\nwizytą',
+
+  5: 'Dworzec\nZachodni',
+  15: 'Dworzec\nGdański',
+  25: 'Dworzec\nWschodni',
+  35: 'Dworzec\nCentralny',
+};
+
+
+function getTileDisplayName(tile) {
+  if (!tile) return '';
+  return TILE_LABEL_OVERRIDES[tile.id] || String(tile.name || '');
+}
 
 function isBuyable(tile) {
   return tile && (tile.type === 'property' || tile.type === 'station' || tile.type === 'utility');
@@ -62,16 +86,33 @@ function computeDisplayedRent(tile, board) {
     const ownedInGroup = countOwnerGroupProps(board, tile.ownerId, tile.group);
     const levels = Array.isArray(tile.rentLevels) ? tile.rentLevels : [];
     if (levels.length === 0) return null;
+
     const idx = clamp(ownedInGroup, 1, levels.length) - 1;
-    const rent = Number(levels[idx] || 0);
-    return { mode: 'fixed', text: `Czynsz: ${rent}` };
+    const base = Number(levels[idx] || 0);
+
+    const houses = Number(tile.houses || 0);
+    const hasHotel = Boolean(tile.hasHotel);
+
+    let rent = base;
+    let suffix = '';
+
+    if (hasHotel) {
+      rent = Math.max(0, Math.round(base * 6));
+      suffix = ' (hotel)';
+    } else if (houses > 0) {
+      rent = Math.max(0, Math.round(base * (1 + houses)));
+      suffix = ` (${houses} dom)`;
+    }
+
+    return { mode: 'fixed', text: `Czynsz: ${rent}${suffix}` };
   }
 
   if (tile.type === 'station') {
     const stations = countOwnerStations(board, tile.ownerId);
     const base = Number(tile.rent || 25);
     const mult = Math.pow(2, clamp(stations, 1, 4) - 1);
-    return { mode: 'fixed', text: `Czynsz: ${base * mult}` };
+    const rent = base * mult;
+    return { mode: 'fixed', text: `Czynsz: ${rent}` };
   }
 
   if (tile.type === 'utility') {
@@ -127,9 +168,7 @@ function formatPaymentButton(payload) {
 function safeClipboardCopy(text) {
   try {
     if (navigator?.clipboard?.writeText) return navigator.clipboard.writeText(text);
-  } catch (e) {
-    // ignore
-  }
+  } catch (e) {}
   return Promise.reject(new Error('Clipboard not available'));
 }
 
@@ -153,8 +192,13 @@ function canAfford(balance, price) {
   return Number(balance || 0) >= Number(price || 0);
 }
 
+function getUpgradeCostClient(tile) {
+  const price = Number(tile?.price || 0);
+  return Math.max(50, Math.round(price * 0.5));
+}
+
 export default function App() {
-  const [screen, setScreen] = useState('home'); // 'home' | 'lobby' | 'game'
+  const [screen, setScreen] = useState('home');
   const [showHowTo, setShowHowTo] = useState(false);
 
   const [nickname, setNickname] = useState('');
@@ -179,30 +223,37 @@ export default function App() {
   const [socketId, setSocketId] = useState(null);
   const [animatedPositions, setAnimatedPositions] = useState({});
 
-  const animatingRef = useRef({}); // { [playerId]: true }
-  const timersRef = useRef({}); // { [playerId]: { timer?: any, preTimer?: any } }
+  const animatingRef = useRef({});
+  const timersRef = useRef({});
+  const delayedPaymentToastsRef = useRef([]);
 
-  const [toast, setToast] = useState(null); // { type:'ok'|'err', text }
+  const [toast, setToast] = useState(null);
 
   const [showWinnerModal, setShowWinnerModal] = useState(false);
 
-  const [cardModal, setCardModal] = useState(null); // { deckLabel, text, nickname, colorKey }
-  const [jailModal, setJailModal] = useState(null); // { fine:number }
+  const [cardModal, setCardModal] = useState(null);
+  const [jailModal, setJailModal] = useState(null);
 
   const [paymentQueue, setPaymentQueue] = useState([]);
   const paymentModal = paymentQueue.length > 0 ? paymentQueue[0] : null;
 
-  // Buy modal
   const [buyModalOpen, setBuyModalOpen] = useState(false);
   const [buyModalTileId, setBuyModalTileId] = useState(null);
 
-  // Turn timer (UI)
+  const [upgradeModalTileId, setUpgradeModalTileId] = useState(null);
+  const [upgradeLoading, setUpgradeLoading] = useState(false);
+  const [upgradeError, setUpgradeError] = useState('');
+
   const [turnDeadlineMs, setTurnDeadlineMs] = useState(null);
   const [turnLeftMs, setTurnLeftMs] = useState(0);
   const lastTurnKeyRef = useRef('');
 
   const activityScrollRef = useRef(null);
   const stickToBottomRef = useRef(true);
+
+  const isInRoom = Boolean(currentRoom);
+  const isPlaying = roomStatus === 'playing';
+  const isWaiting = roomStatus === 'waiting';
 
   function setAnimating(playerId, value) {
     if (!playerId) return;
@@ -254,7 +305,38 @@ export default function App() {
     timersRef.current[playerId] = { ...timersRef.current[playerId], preTimer };
   }
 
-  // Scroll tracking (chat/log)
+  const isHost = Boolean(socketId && hostId && socketId === hostId);
+  const iAmReady = Boolean(socketId && readyById?.[socketId] === true);
+
+  const allReady = useMemo(() => {
+    if (!players || players.length < 2) return false;
+    return players.every((p) => readyById?.[p.id] === true);
+  }, [players, readyById]);
+
+  const ownerColorMap = useMemo(() => {
+    const map = {};
+    const list = gameState?.players?.length ? gameState.players : players;
+    (list || []).forEach((p) => {
+      map[p.id] = p.colorKey || 'blue';
+    });
+    return map;
+  }, [gameState, players]);
+
+  const me = useMemo(() => {
+    return gameState?.players?.find((p) => p.id === socketId) || null;
+  }, [gameState, socketId]);
+
+  const gameOver = Boolean(gameState?.gameOver);
+  const winner = gameState?.winner || null;
+
+  const isMyTurn = Boolean(gameState?.currentPlayerId && socketId && gameState.currentPlayerId === socketId);
+  const currentPlayer = gameState?.players?.find((p) => p.id === gameState?.currentPlayerId) || null;
+
+  const isMeBankrupt = Boolean(me?.isBankrupt);
+  const isMeAnimating = Boolean(socketId && animatingRef.current[socketId]);
+
+  const board = Array.isArray(gameState?.board) ? gameState.board : [];
+  const getTile = (id) => board[id] || null;
   useEffect(() => {
     const el = activityScrollRef.current;
     if (!el) return;
@@ -277,7 +359,6 @@ export default function App() {
     if (stickToBottomRef.current) el.scrollTop = el.scrollHeight;
   }, [messages, gameLog, activeTab]);
 
-  // Countdown ticker
   useEffect(() => {
     const id = setInterval(() => {
       if (!turnDeadlineMs) {
@@ -289,7 +370,6 @@ export default function App() {
     return () => clearInterval(id);
   }, [turnDeadlineMs]);
 
-  // Keep buy modal in sync with server state
   useEffect(() => {
     if (!gameState || !socketId) {
       setBuyModalOpen(false);
@@ -311,6 +391,34 @@ export default function App() {
       setBuyModalTileId(null);
     }
   }, [gameState, socketId]);
+
+  useEffect(() => {
+    if (!upgradeModalTileId) return;
+    if (!gameState || gameOver || !isMyTurn || gameState.phase !== 'awaiting_roll') {
+      setUpgradeModalTileId(null);
+      setUpgradeLoading(false);
+      setUpgradeError('');
+      return;
+    }
+    if (isMeAnimating) {
+      setUpgradeModalTileId(null);
+      setUpgradeLoading(false);
+      setUpgradeError('');
+    }
+  }, [upgradeModalTileId, gameState, gameOver, isMyTurn, isMeAnimating]);
+
+  useEffect(() => {
+    if (gameOver) setShowWinnerModal(true);
+  }, [gameOver]);
+
+  useEffect(() => {
+    if (!jailModal) return;
+    if (gameOver) setJailModal(null);
+  }, [jailModal, gameOver]);
+
+  useEffect(() => {
+    if (isPlaying) setScreen('game');
+  }, [isPlaying]);
 
   useEffect(() => {
     const updateSocketId = () => setSocketId(socket.id || null);
@@ -338,12 +446,16 @@ export default function App() {
       setCardModal(null);
       setJailModal(null);
       setPaymentQueue([]);
+      delayedPaymentToastsRef.current = [];
       setAnimatedPositions({});
       setToast({ type: 'ok', text: 'Nowa gra' });
       setTimeout(() => setToast(null), 1600);
 
       setBuyModalOpen(false);
       setBuyModalTileId(null);
+      setUpgradeModalTileId(null);
+      setUpgradeLoading(false);
+      setUpgradeError('');
 
       setTurnDeadlineMs(null);
       setTurnLeftMs(0);
@@ -410,12 +522,6 @@ export default function App() {
         const duration = isDisc ? DISCONNECT_GRACE_MS : TURN_TIMEOUT_MS;
         setTurnDeadlineMs(Date.now() + duration);
       }
-
-      if (!currentId) {
-        setTurnDeadlineMs(null);
-        setTurnLeftMs(0);
-        lastTurnKeyRef.current = '';
-      }
     };
 
     const onGameState = (state) => {
@@ -454,7 +560,20 @@ export default function App() {
 
     const onToast = (payload) => {
       if (!payload || !payload.text) return;
-      setToast({ type: payload.type === 'ok' ? 'ok' : 'err', text: String(payload.text) });
+
+      const text = String(payload.text || '');
+      const isRentPayerToast = text.startsWith('Czynsz: -');
+      const isTaxToast = text.startsWith('Podatek:');
+
+      if (isRentPayerToast || isTaxToast) {
+        delayedPaymentToastsRef.current.push({
+          type: payload.type === 'ok' ? 'ok' : 'err',
+          text,
+        });
+        return;
+      }
+
+      setToast({ type: payload.type === 'ok' ? 'ok' : 'err', text });
       setTimeout(() => setToast(null), 2200);
     };
 
@@ -477,7 +596,6 @@ export default function App() {
 
     const onPaymentPrompt = (payload) => {
       if (!payload) return;
-      // IMPORTANT: listen only to camelCase event to avoid duplicates
       setPaymentQueue((prev) => [...prev, payload]);
     };
 
@@ -495,7 +613,6 @@ export default function App() {
     socket.on('playerMovePath', onPlayerMovePath);
     socket.on('toast', onToast);
 
-    // Only camelCase events (fixes duplicated modals)
     socket.on('cardDrawn', onCardDrawn);
     socket.on('jailPrompt', onJailPrompt);
     socket.on('paymentPrompt', onPaymentPrompt);
@@ -521,47 +638,6 @@ export default function App() {
     };
   }, []);
 
-  const isInRoom = Boolean(currentRoom);
-  const isPlaying = roomStatus === 'playing';
-  const isWaiting = roomStatus === 'waiting';
-
-  const isHost = Boolean(socketId && hostId && socketId === hostId);
-  const iAmReady = Boolean(socketId && readyById?.[socketId] === true);
-
-  const allReady = useMemo(() => {
-    if (!players || players.length < 2) return false;
-    return players.every((p) => readyById?.[p.id] === true);
-  }, [players, readyById]);
-
-  const ownerColorMap = useMemo(() => {
-    const map = {};
-    const list = gameState?.players?.length ? gameState.players : players;
-    (list || []).forEach((p) => {
-      map[p.id] = p.colorKey || 'blue';
-    });
-    return map;
-  }, [gameState, players]);
-
-  const me = useMemo(() => {
-    return gameState?.players?.find((p) => p.id === socketId) || null;
-  }, [gameState, socketId]);
-
-  const gameOver = Boolean(gameState?.gameOver);
-  const winner = gameState?.winner || null;
-
-  useEffect(() => {
-    if (gameOver) setShowWinnerModal(true);
-  }, [gameOver]);
-
-  useEffect(() => {
-    if (!jailModal) return;
-    if (gameOver) setJailModal(null);
-  }, [jailModal, gameOver]);
-
-  useEffect(() => {
-    if (isPlaying) setScreen('game');
-  }, [isPlaying]);
-
   const resetUiForLobby = () => {
     setMessages([]);
     setGameLog([]);
@@ -574,25 +650,17 @@ export default function App() {
     setCardModal(null);
     setJailModal(null);
     setPaymentQueue([]);
+    delayedPaymentToastsRef.current = [];
     setBuyModalOpen(false);
     setBuyModalTileId(null);
+    setUpgradeModalTileId(null);
+    setUpgradeLoading(false);
+    setUpgradeError('');
 
     setTurnDeadlineMs(null);
     setTurnLeftMs(0);
     lastTurnKeyRef.current = '';
   };
-
-  const handleGoToLobby = () => {
-    setScreen('lobby');
-    setError('');
-  };
-
-  const handleBackToHome = () => {
-    setScreen('home');
-    setShowHowTo(false);
-    setError('');
-  };
-
   const handleCreateRoom = () => {
     if (!nickname.trim()) return setError('Podaj swój nick');
     setError('');
@@ -684,7 +752,6 @@ export default function App() {
     setMessageText('');
   };
 
-  // FIX: emit only camelCase to avoid duplicates
   const handleJailPay = () => {
     if (!currentRoom) return;
     socket.emit('jailChoice', { roomCode: currentRoom, pay: true });
@@ -697,7 +764,6 @@ export default function App() {
     setJailModal(null);
   };
 
-  // FIX: emit only camelCase to avoid duplicates
   const handleCardOk = () => {
     if (!currentRoom) return;
     setCardModal(null);
@@ -706,6 +772,24 @@ export default function App() {
 
   const handlePaymentOk = () => {
     setPaymentQueue((prev) => prev.slice(1));
+
+    const next = delayedPaymentToastsRef.current.shift();
+    if (next?.text) {
+      setToast({ type: next.type === 'ok' ? 'ok' : 'err', text: next.text });
+      setTimeout(() => setToast(null), 2200);
+    }
+  };
+
+  const handleBuyConfirm = () => {
+    if (!currentRoom) return;
+    socket.emit('buyTile', { roomCode: currentRoom }, () => {});
+    setBuyModalOpen(false);
+  };
+
+  const handleBuySkip = () => {
+    if (!currentRoom) return;
+    socket.emit('skipBuy', { roomCode: currentRoom }, () => {});
+    setBuyModalOpen(false);
   };
 
   const handleCopyRoomCode = async () => {
@@ -720,37 +804,89 @@ export default function App() {
     }
   };
 
-  const handleBuyConfirm = () => {
-    if (!currentRoom) return;
-    socket.emit('buyTile', { roomCode: currentRoom }, (res) => {
-      if (!res?.ok) {
-        setToast({ type: 'err', text: 'Nie można kupić pola.' });
-        setTimeout(() => setToast(null), 2200);
+  function hasMonopolyClient(tile) {
+    if (!tile || tile.type !== 'property') return false;
+    const setSize = Number(tile.setSize || 0);
+    if (!setSize || !tile.group || !socketId) return false;
+    const owned = countOwnerGroupProps(board, socketId, tile.group);
+    return owned >= setSize;
+  }
+
+  const canOpenUpgrade =
+    !gameOver &&
+    isMyTurn &&
+    !isMeBankrupt &&
+    !isMeAnimating &&
+    !cardModal &&
+    !jailModal &&
+    !paymentModal &&
+    !buyModalOpen &&
+    gameState?.phase === 'awaiting_roll';
+
+  const handleOpenUpgradeFromTile = (tile) => {
+    if (!tile) return;
+    if (!canOpenUpgrade) return;
+    if (tile.type !== 'property') return;
+    if (tile.ownerId !== socketId) return;
+    if (!hasMonopolyClient(tile)) return;
+
+    setUpgradeError('');
+    setUpgradeLoading(false);
+    setUpgradeModalTileId(tile.id);
+  };
+
+  const upgradeTile = upgradeModalTileId !== null ? getTile(upgradeModalTileId) : null;
+  const upgradeCost = upgradeTile ? getUpgradeCostClient(upgradeTile) : 0;
+  const upgradeHasHotel = Boolean(upgradeTile?.hasHotel);
+  const upgradeHouses = Number(upgradeTile?.houses || 0);
+  const upgradeActionLabel = upgradeHasHotel
+    ? 'Maksimum'
+    : upgradeHouses < 4
+    ? `Kup domek (${upgradeHouses + 1}/4)`
+    : 'Kup hotel';
+
+  const handleUpgradeConfirm = () => {
+    if (!currentRoom || !upgradeTile) return;
+
+    setUpgradeLoading(true);
+    setUpgradeError('');
+
+    const timeout = setTimeout(() => {
+      setUpgradeLoading(false);
+      setUpgradeError('Brak odpowiedzi z serwera. Spróbuj ponownie.');
+    }, 3500);
+
+    socket.emit('upgradeTile', { roomCode: currentRoom, tileId: upgradeTile.id }, (res) => {
+      clearTimeout(timeout);
+
+      if (res?.ok) {
+        setUpgradeLoading(false);
+        setUpgradeError('');
+        setUpgradeModalTileId(null);
+        return;
       }
+
+      const map = {
+        NOT_PLAYING: 'Gra nie jest aktywna.',
+        GAME_OVER: 'Gra zakończona.',
+        NOT_YOUR_TURN: 'To nie twoja tura.',
+        DISCONNECTED: 'Jesteś rozłączony.',
+        BANKRUPT: 'Jesteś bankrutem.',
+        NOT_IN_UPGRADE_PHASE: 'Ulepszenia tylko przed rzutem kośćmi.',
+        TILE_NOT_FOUND: 'Nie znaleziono pola.',
+        NOT_PROPERTY: 'To nie jest nieruchomość.',
+        NOT_OWNER: 'Nie jesteś właścicielem.',
+        NO_MONOPOLY: 'Brak pełnego seta (monopolii).',
+        NO_MONEY: 'Brak pieniędzy.',
+        ALREADY_HOTEL: 'Hotel już istnieje.',
+      };
+
+      setUpgradeLoading(false);
+      setUpgradeError(map[res?.error] || 'Nie można wykonać ulepszenia.');
     });
-    setBuyModalOpen(false);
   };
 
-  const handleBuySkip = () => {
-    if (!currentRoom) return;
-    socket.emit('skipBuy', { roomCode: currentRoom });
-    setBuyModalOpen(false);
-  };
-
-  const isMyTurn = Boolean(gameState?.currentPlayerId && socketId && gameState.currentPlayerId === socketId);
-  const currentPlayer = gameState?.players?.find((p) => p.id === gameState?.currentPlayerId) || null;
-
-  const isMeBankrupt = Boolean(me?.isBankrupt);
-  const isMeAnimating = Boolean(socketId && animatingRef.current[socketId]);
-
-  const board = Array.isArray(gameState?.board) ? gameState.board : [];
-  const getTile = (id) => board[id] || null;
-
-  const buyTile = useMemo(() => {
-    if (typeof buyModalTileId !== 'number') return null;
-    return getTile(buyModalTileId);
-  }, [buyModalTileId, board]);
-
+  const buyTile = typeof buyModalTileId === 'number' ? getTile(buyModalTileId) : null;
   const meBalance = Number(me?.balance || 0);
   const buyPrice = Number(buyTile?.price || 0);
   const buyAfter = meBalance - buyPrice;
@@ -765,18 +901,6 @@ export default function App() {
     return { group, setSize, ownedInGroup, afterOwned, missing };
   }, [buyTile, board, socketId]);
 
-  const canBuyNow = Boolean(
-    !gameOver &&
-      !isMeBankrupt &&
-      !isMeAnimating &&
-      !cardModal &&
-      !jailModal &&
-      !paymentModal &&
-      isMyTurn &&
-      gameState?.phase === 'awaiting_buy' &&
-      gameState?.pending?.playerId === socketId
-  );
-
   const tl = getTile(20);
   const tr = getTile(30);
   const bl = getTile(10);
@@ -787,12 +911,57 @@ export default function App() {
   const leftEdgeIds = makeRange(11, 19).reverse();
   const rightEdgeIds = makeRange(31, 39);
 
+  const currentTurnTimerText = useMemo(() => {
+    if (!isPlaying || gameOver) return '';
+    if (!currentPlayer?.id) return '';
+    return formatTimeLeft(turnLeftMs);
+  }, [isPlaying, gameOver, currentPlayer, turnLeftMs]);
+
+  const winnerId = winner?.id || null;
+
+  const winnerPlayers = useMemo(() => {
+    const list = Array.isArray(gameState?.players) ? [...gameState.players] : [];
+    list.sort((a, b) => {
+      const aW = winnerId && a.id === winnerId ? 1 : 0;
+      const bW = winnerId && b.id === winnerId ? 1 : 0;
+      if (aW !== bW) return bW - aW;
+
+      const aActive = a.isBankrupt ? 0 : 1;
+      const bActive = b.isBankrupt ? 0 : 1;
+      if (aActive !== bActive) return bActive - aActive;
+
+      return Number(b.balance || 0) - Number(a.balance || 0);
+    });
+    return list;
+  }, [gameState, winnerId]);
+
+  const summaryCounts = useMemo(() => {
+    const list = winnerPlayers;
+    const total = list.length;
+    const bankrupt = list.filter((p) => p.isBankrupt).length;
+    const offline = list.filter((p) => p.isDisconnected && !p.isBankrupt).length;
+    return { total, bankrupt, offline };
+  }, [winnerPlayers]);
+
+  const getPlayerStatusLabel = (p) => {
+    if (p?.isBankrupt) return 'BANKRUT';
+    if (p?.isDisconnected) return 'OFFLINE';
+    if (p?.inJail) return 'WIĘZIENIE';
+    return 'AKTYWNY';
+  };
+
   const renderTile = (tile, side, extraClass = '') => {
     if (!tile) return null;
 
     const ownerColorKey = tile.ownerId ? ownerColorMap[tile.ownerId] || 'blue' : null;
     const ownedClass = ownerColorKey ? `owned--${ownerColorKey}` : '';
     const typeClass = `board-tile--${tile.type || 'property'}`;
+
+    const clickableUpgrade =
+      canOpenUpgrade &&
+      tile.type === 'property' &&
+      tile.ownerId === socketId &&
+      hasMonopolyClient(tile);
 
     const tileClass = [
       'board-tile',
@@ -823,12 +992,64 @@ export default function App() {
       (p) => (animatedPositions[p.id] ?? p.position) === tile.id
     );
 
+    const houses = Number(tile.houses || 0);
+    const hasHotel = Boolean(tile.hasHotel);
+    const showUpgrades = tile.type === 'property' && (houses > 0 || hasHotel);
+
     return (
-      <div className={tileClass} title={tile.name}>
+      <div
+        className={tileClass}
+        title={clickableUpgrade ? `${tile.name} (kliknij: ulepszenia)` : tile.name}
+        onClick={() => {
+          if (clickableUpgrade) handleOpenUpgradeFromTile(tile);
+        }}
+        style={clickableUpgrade ? { cursor: 'pointer' } : undefined}
+      >
         {badgeText && <div className="price-badge">{badgeText}</div>}
 
+        {showUpgrades && (
+          <div
+            style={{
+              position: 'absolute',
+              right: 8,
+              bottom: 8,
+              zIndex: 30,
+              fontSize: 12,
+              fontWeight: 950,
+              opacity: 0.95,
+              display: 'flex',
+              gap: 4,
+              alignItems: 'center',
+              pointerEvents: 'none',
+              background: 'rgba(2,6,23,0.65)',
+              border: '1px solid rgba(255,255,255,0.14)',
+              borderRadius: 10,
+              padding: '3px 6px',
+            }}
+          >
+            {hasHotel ? (
+              <>
+                <span style={{ fontSize: 13 }}>🏨</span>
+                <span>Hotel</span>
+              </>
+            ) : (
+              <>
+                <span style={{ fontSize: 13 }}>🏠</span>
+                <span>{houses}/4</span>
+              </>
+            )}
+          </div>
+        )}
+
         <div className="tile-top">
-          <div className="tile-name">{tile.name}</div>
+          <div className="tile-name">
+             {getTileDisplayName(tile).split('\n').map((part, idx, arr) => (
+              <React.Fragment key={idx}>
+                {part}
+                {idx < arr.length - 1 ? <br /> : null}
+              </React.Fragment>
+            ))}
+          </div>
         </div>
 
         <div className="tile-tokens">
@@ -847,36 +1068,16 @@ export default function App() {
     );
   };
 
-  const playersSortedForModal = useMemo(() => {
-    const list = Array.isArray(gameState?.players) ? [...gameState.players] : [];
-    const winnerId = winner?.id || null;
-
-    list.sort((a, b) => {
-      const aW = a.id === winnerId ? 1 : 0;
-      const bW = b.id === winnerId ? 1 : 0;
-      if (aW !== bW) return bW - aW;
-
-      const aB = a.isBankrupt ? 1 : 0;
-      const bB = b.isBankrupt ? 1 : 0;
-      if (aB !== bB) return aB - bB;
-
-      return (b.balance || 0) - (a.balance || 0);
-    });
-
-    return list;
-  }, [gameState, winner]);
-
-  const currentTurnTimerText = useMemo(() => {
+  const currentTurnTimerTextMemo = useMemo(() => {
     if (!isPlaying || gameOver) return '';
     if (!currentPlayer?.id) return '';
     return formatTimeLeft(turnLeftMs);
   }, [isPlaying, gameOver, currentPlayer, turnLeftMs]);
 
-  const showMenu = screen !== 'game';
   return (
     <div className="app">
       <div className="card">
-        {showMenu && (
+        {!isPlaying && (
           <div className="menu-shell">
             <div className="menu-card">
               {screen === 'home' && (
@@ -885,7 +1086,7 @@ export default function App() {
                   <div className="menu-sub">Multiplayer • Socket.IO • Monopoly-like</div>
 
                   <div className="menu-actions" style={{ flexDirection: 'column', alignItems: 'stretch' }}>
-                    <button type="button" onClick={handleGoToLobby} style={{ width: '100%' }}>
+                    <button type="button" onClick={() => setScreen('lobby')} style={{ width: '100%' }}>
                       Nowa gra
                     </button>
                     <button
@@ -910,7 +1111,7 @@ export default function App() {
                   <div className="menu-topbar">
                     <button
                       type="button"
-                      onClick={handleBackToHome}
+                      onClick={() => setScreen('home')}
                       className="menu-back"
                       style={{ background: '#334155' }}
                     >
@@ -923,7 +1124,11 @@ export default function App() {
                   <div className="menu-section">
                     <label>
                       Nick:
-                      <input value={nickname} onChange={(e) => setNickname(e.target.value)} placeholder="Wpisz nick..." />
+                      <input
+                        value={nickname}
+                        onChange={(e) => setNickname(e.target.value)}
+                        placeholder="Wpisz nick..."
+                      />
                     </label>
 
                     {!isInRoom && (
@@ -940,7 +1145,12 @@ export default function App() {
                         {error && <div style={{ color: '#f97373', marginTop: 8, fontSize: 13 }}>{error}</div>}
 
                         <div className="menu-actions" style={{ flexDirection: 'column', alignItems: 'stretch' }}>
-                          <button onClick={handleCreateRoom} disabled={loadingRoom} type="button" style={{ width: '100%' }}>
+                          <button
+                            onClick={handleCreateRoom}
+                            disabled={loadingRoom}
+                            type="button"
+                            style={{ width: '100%' }}
+                          >
                             {loadingRoom ? 'Tworzenie...' : 'Stwórz pokój'}
                           </button>
 
@@ -961,10 +1171,6 @@ export default function App() {
                             Jak grać
                           </button>
                         </div>
-
-                        <div className="menu-hint">
-                          Host tworzy pokój, kopiuje kod i wysyła znajomemu. Drugi gracz dołącza kodem.
-                        </div>
                       </>
                     )}
 
@@ -974,16 +1180,12 @@ export default function App() {
                           Pokój: <strong>{currentRoom}</strong>
                         </div>
 
-                        <div className="menu-actions" style={{ marginTop: 10, flexDirection: 'column', alignItems: 'stretch' }}>
+                        <div
+                          className="menu-actions"
+                          style={{ marginTop: 10, flexDirection: 'column', alignItems: 'stretch' }}
+                        >
                           <button type="button" onClick={handleCopyRoomCode} style={{ width: '100%', marginTop: 0 }}>
                             Kopiuj kod
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setShowHowTo(true)}
-                            style={{ background: '#334155', width: '100%', marginTop: 0 }}
-                          >
-                            Jak grać
                           </button>
                         </div>
 
@@ -1009,15 +1211,12 @@ export default function App() {
                               {iAmReady ? 'Nie gotowy' : 'Gotowy'}
                             </button>
                           )}
-
                           {isHost && (
                             <button type="button" onClick={handleStartGame} disabled={!allReady}>
                               Rozpocznij grę
                             </button>
                           )}
                         </div>
-
-                        {!allReady && <div className="lobby-hint">Wymagane: minimum 2 graczy i wszyscy GOTOWI.</div>}
                       </div>
                     )}
                   </div>
@@ -1030,76 +1229,12 @@ export default function App() {
                 <div className="modal-card">
                   <div className="modal-title">Jak grać</div>
                   <div className="modal-body" style={{ textAlign: 'left' }}>
-                    {/* (rules content stays unchanged) */}
-                    <div style={{ marginBottom: 12 }}>
-                      <strong>W skrócie</strong>
-                      <div className="muted" style={{ marginTop: 6, lineHeight: 1.55 }}>
-                        Twoim celem jest zostać ostatnim graczem, który nie zbankrutuje. Kupuj nieruchomości, pobieraj czynsz
-                        i pilnuj, żeby zawsze mieć zapas gotówki na podatki oraz opłaty.
-                      </div>
-                    </div>
-                    <div style={{ marginBottom: 12 }}>
-                      <strong>1) Jak zacząć grę (multiplayer)</strong>
-                      <div className="muted" style={{ marginTop: 6, lineHeight: 1.55 }}>
-                        • Host wybiera <strong>Stwórz pokój</strong>, a potem kopiuje kod pokoju i wysyła go znajomym.<br />
-                        • Pozostali gracze wpisują kod i klikają <strong>Dołącz do pokoju</strong>.<br />
-                        • W lobby każdy ustawia status <strong>GOTOWY</strong> (minimum 2 graczy).<br />
-                        • Gdy wszyscy są gotowi, host uruchamia rozgrywkę.
-                      </div>
-                    </div>
-                    <div style={{ marginBottom: 12 }}>
-                      <strong>2) Tura gracza</strong>
-                      <div className="muted" style={{ marginTop: 6, lineHeight: 1.55 }}>
-                        W swojej turze rzucasz <strong>dwiema kośćmi (2d6)</strong> i przesuwasz pionek o wylosowaną liczbę pól.
-                        Po ruchu dzieje się jedna z kilku rzeczy:
-                        <div style={{ marginTop: 8 }}>
-                          • Jeśli pole jest wolne i możliwe do kupienia — możesz je <strong>kupić</strong> albo <strong>pominąć</strong> zakup.<br />
-                          • Jeśli staniesz na cudzym polu — płacisz <strong>czynsz</strong> właścicielowi.<br />
-                          • Jeśli trafisz na podatek — płacisz odpowiednią kwotę.<br />
-                          • Jeśli wejdziesz na <strong>Szansa</strong> lub <strong>Kasa społeczna</strong> — losujesz kartę.
-                        </div>
-                      </div>
-                    </div>
-                    <div style={{ marginBottom: 12 }}>
-                      <strong>3) Kupowanie i czynsz</strong>
-                      <div className="muted" style={{ marginTop: 6, lineHeight: 1.55 }}>
-                        Nieruchomości, dworce i media można kupować, gdy są wolne. Kupione pole zaczyna dla Ciebie pracować:
-                        gdy inny gracz na nie wejdzie, zapłaci <strong>czynsz</strong>.
-                      </div>
-                    </div>
-                    <div style={{ marginBottom: 12 }}>
-                      <strong>4) START i pola specjalne</strong>
-                      <div className="muted" style={{ marginTop: 6, lineHeight: 1.55 }}>
-                        Gdy przejdziesz przez START, otrzymujesz bonus <strong>+200</strong> (gra nalicza to automatycznie).
-                        Uważaj też na pola „Idź do więzienia” oraz podatki — potrafią szybko uszczuplić budżet.
-                      </div>
-                    </div>
-                    <div style={{ marginBottom: 12 }}>
-                      <strong>5) Karty: Szansa / Kasa społeczna</strong>
-                      <div className="muted" style={{ marginTop: 6, lineHeight: 1.55 }}>
-                        Karta wyświetla się tylko graczowi, który ją wylosował. Po kliknięciu <strong>OK</strong> efekt zostaje zastosowany
-                        (np. ruch pionka, nagroda, opłata albo więzienie).
-                      </div>
-                    </div>
-                    <div style={{ marginBottom: 12 }}>
-                      <strong>6) Więzienie</strong>
-                      <div className="muted" style={{ marginTop: 6, lineHeight: 1.55 }}>
-                        Jeśli trafisz do więzienia, dostajesz wybór:
-                        <div style={{ marginTop: 8 }}>
-                          • <strong>Zapłać karę</strong> i wychodzisz od razu.<br />
-                          • <strong>Pomiń turę</strong> — zostajesz w więzieniu i tracisz tę kolejkę.
-                        </div>
-                      </div>
-                    </div>
-                    <div>
-                      <strong>7) Bankructwo i zwycięstwo</strong>
-                      <div className="muted" style={{ marginTop: 6, lineHeight: 1.55 }}>
-                        Jeśli Twoje saldo spadnie poniżej zera — bankrutujesz, a Twoje pola wracają do banku.
-                        Wygrywa ostatni gracz, który pozostaje aktywny.
-                      </div>
+                    <div className="muted" style={{ lineHeight: 1.55 }}>
+                      • 60s na turę (auto-akcja po czasie).<br />
+                      • 90s na reconnect jeśli gracz jest offline w swojej turze.<br />
+                      • 3 pominięte tury offline → forfeit/bankrut.
                     </div>
                   </div>
-
                   <div className="modal-actions">
                     <button
                       type="button"
@@ -1112,29 +1247,86 @@ export default function App() {
                 </div>
               </div>
             )}
-
-            {toast && (
-              <div className={'floating-toast ' + (toast.type === 'ok' ? 'floating-toast--ok' : 'floating-toast--err')}>
-                {toast.text}
-              </div>
-            )}
           </div>
         )}
-
-        {screen === 'game' && isPlaying && gameState && (
+        {isPlaying && gameState && (
           <div className="game-shell">
-            {/* ✅ Show modals only AFTER animation finishes */}
-            {paymentModal && !cardModal && !jailModal && !buyModalOpen && !isMeAnimating && (
+            {upgradeTile && !isMeAnimating && (
+              <div className="modal-overlay" style={{ zIndex: 9999 }}>
+                <div className="modal-card" style={{ width: 'min(720px, 100%)', textAlign: 'left' }}>
+                  <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12 }}>
+                    <div>
+                      <div className="modal-title" style={{ margin: 0, textAlign: 'left' }}>
+                        Ulepszenia: {upgradeTile.name}
+                      </div>
+                      <div className="muted" style={{ marginTop: 6, lineHeight: 1.45 }}>
+                        Pełny set (monopolia). Ulepszenia tylko przed rzutem kośćmi.
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setUpgradeModalTileId(null);
+                        setUpgradeLoading(false);
+                        setUpgradeError('');
+                      }}
+                      style={{ width: 'auto', padding: '10px 14px', marginTop: 0, background: '#334155' }}
+                    >
+                      Zamknij
+                    </button>
+                  </div>
+
+                  <div
+                    style={{
+                      marginTop: 12,
+                      borderRadius: 14,
+                      border: '1px solid rgba(255,255,255,0.10)',
+                      background: 'rgba(3,7,18,0.55)',
+                      padding: 12,
+                    }}
+                  >
+                    <div className="muted" style={{ fontSize: 12 }}>
+                      Stan: <strong>{upgradeHasHotel ? 'Hotel' : `Domki ${upgradeHouses}/4`}</strong> • Koszt:{' '}
+                      <strong>{upgradeCost}</strong>
+                    </div>
+
+                    {upgradeError && <div style={{ marginTop: 10, color: '#f87171', fontSize: 13 }}>{upgradeError}</div>}
+                  </div>
+
+                  <div style={{ marginTop: 14, display: 'flex', justifyContent: 'flex-end', gap: 10, flexWrap: 'wrap' }}>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setUpgradeModalTileId(null);
+                        setUpgradeLoading(false);
+                        setUpgradeError('');
+                      }}
+                      style={{ width: 'auto', padding: '10px 14px', marginTop: 0, background: '#334155' }}
+                      disabled={upgradeLoading}
+                    >
+                      Anuluj
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={handleUpgradeConfirm}
+                      disabled={upgradeLoading || upgradeHasHotel || !canAfford(meBalance, upgradeCost)}
+                      style={{ width: 'auto', padding: '10px 14px', marginTop: 0 }}
+                    >
+                      {upgradeLoading ? 'Kupuję...' : upgradeActionLabel}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {paymentModal && !cardModal && !jailModal && !buyModalOpen && !upgradeTile && !isMeAnimating && (
               <div className="modal-overlay" style={{ zIndex: 9999 }}>
                 <div className="modal-card" style={{ width: 'min(620px, 100%)' }}>
                   <div className="modal-title">{formatPaymentTitle(paymentModal)}</div>
                   <div className="modal-body">{formatPaymentBody(paymentModal)}</div>
                   <div className="modal-actions">
-                    <button
-                      type="button"
-                      onClick={handlePaymentOk}
-                      style={{ width: 'auto', padding: '10px 18px', marginTop: 0 }}
-                    >
+                    <button type="button" onClick={handlePaymentOk} style={{ width: 'auto', padding: '10px 18px', marginTop: 0 }}>
                       {formatPaymentButton(paymentModal)}
                     </button>
                   </div>
@@ -1142,10 +1334,9 @@ export default function App() {
               </div>
             )}
 
-            {buyModalOpen && canBuyNow && buyTile && !isMeAnimating && (
+            {buyModalOpen && buyTile && !upgradeTile && !isMeAnimating && (
               <div className="modal-overlay" style={{ zIndex: 9999 }}>
                 <div className="modal-card" style={{ width: 'min(720px, 100%)', textAlign: 'left' }}>
-                  {/* (buy modal content unchanged) */}
                   <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12 }}>
                     <div>
                       <div className="modal-title" style={{ margin: 0, textAlign: 'left' }}>
@@ -1184,31 +1375,13 @@ export default function App() {
                     <div style={{ fontWeight: 950, fontSize: 16 }}>{buyTile.name}</div>
 
                     <div style={{ marginTop: 10, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-                      <div
-                        style={{
-                          borderRadius: 12,
-                          border: '1px solid rgba(255,255,255,0.10)',
-                          background: 'rgba(2,6,23,0.55)',
-                          padding: 10,
-                        }}
-                      >
-                        <div className="muted" style={{ fontSize: 12 }}>
-                          Cena zakupu
-                        </div>
+                      <div style={{ borderRadius: 12, border: '1px solid rgba(255,255,255,0.10)', background: 'rgba(2,6,23,0.55)', padding: 10 }}>
+                        <div className="muted" style={{ fontSize: 12 }}>Cena zakupu</div>
                         <div style={{ marginTop: 4, fontWeight: 950, fontSize: 18 }}>{buyPrice}</div>
                       </div>
 
-                      <div
-                        style={{
-                          borderRadius: 12,
-                          border: '1px solid rgba(255,255,255,0.10)',
-                          background: 'rgba(2,6,23,0.55)',
-                          padding: 10,
-                        }}
-                      >
-                        <div className="muted" style={{ fontSize: 12 }}>
-                          Saldo (teraz → po zakupie)
-                        </div>
+                      <div style={{ borderRadius: 12, border: '1px solid rgba(255,255,255,0.10)', background: 'rgba(2,6,23,0.55)', padding: 10 }}>
+                        <div className="muted" style={{ fontSize: 12 }}>Saldo (teraz → po zakupie)</div>
                         <div style={{ marginTop: 4, fontWeight: 950, fontSize: 16 }}>
                           {meBalance} →{' '}
                           <span style={{ color: canAfford(meBalance, buyPrice) ? '#e5e7eb' : '#f87171' }}>
@@ -1236,37 +1409,15 @@ export default function App() {
                         </div>
                       </div>
                     )}
-
-                    {buyTile.type !== 'property' && (
-                      <div className="muted" style={{ marginTop: 10, lineHeight: 1.5 }}>
-                        To pole przynosi zyski, gdy inni gracze na nie wejdą (czynsz).
-                      </div>
-                    )}
                   </div>
 
-                  <div style={{ marginTop: 14, display: 'flex', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
-                    <div className="muted" style={{ fontSize: 12, lineHeight: 1.45 }}>
-                      Wskazówka: zostaw trochę gotówki na podatki i czynsze.
-                    </div>
-
-                    <div style={{ display: 'flex', gap: 10 }}>
-                      <button
-                        type="button"
-                        onClick={handleBuySkip}
-                        style={{ width: 'auto', padding: '10px 14px', marginTop: 0, background: '#334155' }}
-                      >
-                        Pomiń zakup
-                      </button>
-
-                      <button
-                        type="button"
-                        onClick={handleBuyConfirm}
-                        disabled={!canAfford(meBalance, buyPrice)}
-                        style={{ width: 'auto', padding: '10px 14px', marginTop: 0 }}
-                      >
-                        Kup za {buyPrice}
-                      </button>
-                    </div>
+                  <div style={{ marginTop: 14, display: 'flex', justifyContent: 'flex-end', gap: 10, flexWrap: 'wrap' }}>
+                    <button type="button" onClick={handleBuySkip} style={{ width: 'auto', padding: '10px 14px', marginTop: 0, background: '#334155' }}>
+                      Pomiń zakup
+                    </button>
+                    <button type="button" onClick={handleBuyConfirm} disabled={!canAfford(meBalance, buyPrice)} style={{ width: 'auto', padding: '10px 14px', marginTop: 0 }}>
+                      Kup za {buyPrice}
+                    </button>
                   </div>
 
                   {!canAfford(meBalance, buyPrice) && (
@@ -1278,29 +1429,11 @@ export default function App() {
               </div>
             )}
 
-            {cardModal && !isMeAnimating && (
+            {cardModal && !upgradeTile && !isMeAnimating && (
               <div className="modal-overlay" style={{ zIndex: 9998 }}>
                 <div className="modal-card" style={{ width: 'min(620px, 100%)' }}>
                   <div className="modal-title">{cardModal.deckLabel || 'Karta'}</div>
                   <div className="modal-body">{cardModal.text}</div>
-
-                  {cardModal.nickname && (
-                    <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, opacity: 0.9 }}>
-                      <div
-                        style={{
-                          width: 12,
-                          height: 12,
-                          borderRadius: 999,
-                          background: COLOR_HEX[cardModal.colorKey || 'blue'] || '#94a3b8',
-                          border: '1px solid rgba(255,255,255,0.35)',
-                        }}
-                      />
-                      <div style={{ fontSize: 13 }}>
-                        Gracz: <strong>{cardModal.nickname}</strong>
-                      </div>
-                    </div>
-                  )}
-
                   <div className="modal-actions">
                     <button type="button" onClick={handleCardOk} style={{ width: 'auto', padding: '10px 18px', marginTop: 0 }}>
                       OK
@@ -1310,20 +1443,17 @@ export default function App() {
               </div>
             )}
 
-            {jailModal && !isMeAnimating && (
+            {jailModal && !upgradeTile && !isMeAnimating && (
               <div className="modal-overlay" style={{ zIndex: 9999 }}>
                 <div className="modal-card" style={{ width: 'min(680px, 100%)' }}>
                   <div className="modal-title">Więzienie</div>
-
                   <div className="modal-body">
                     Wybierz opcję:
                     <div className="muted" style={{ marginTop: 8, lineHeight: 1.5 }}>
-                      • Zapłać <strong>{jailModal.fine}</strong> i wyjdź z więzienia
-                      <br />
+                      • Zapłać <strong>{jailModal.fine}</strong> i wyjdź z więzienia<br />
                       • Pomiń turę
                     </div>
                   </div>
-
                   <div className="modal-actions" style={{ gap: 10, flexWrap: 'wrap' }}>
                     <button type="button" onClick={handleJailPay} style={{ width: 'auto', padding: '10px 14px', marginTop: 0 }}>
                       Zapłać {jailModal.fine}
@@ -1336,105 +1466,114 @@ export default function App() {
               </div>
             )}
 
-            {/* Winner modal can show immediately */}
             {gameOver && showWinnerModal && (
               <div className="modal-overlay" style={{ zIndex: 9997 }}>
-                <div className="modal-card" style={{ width: 'min(720px, 100%)' }}>
+                <div className="modal-card" style={{ width: 'min(620px, 100%)', textAlign: 'left' }}>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
                     <div className="modal-title" style={{ margin: 0 }}>
                       {winner ? `Zwycięzca: ${winner.nickname}` : 'Koniec gry'}
                     </div>
-                    <button type="button" onClick={() => setShowWinnerModal(false)} style={{ width: 'auto', padding: '10px 14px', marginTop: 0, background: '#334155' }}>
+                    <button
+                      type="button"
+                      onClick={() => setShowWinnerModal(false)}
+                      style={{ width: 'auto', padding: '10px 14px', marginTop: 0, background: '#334155' }}
+                    >
                       Zamknij
                     </button>
                   </div>
 
-                  <div className="muted" style={{ marginTop: 10, fontSize: 13 }}>
-                    Lista graczy:
-                  </div>
-
-                  <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 10 }}>
-                    {playersSortedForModal.map((p) => {
-                      const isW = winner && p.id === winner.id;
-                      const isB = Boolean(p.isBankrupt);
-                      const badge = isW ? 'WINNER' : isB ? 'BANKRUT' : 'AKTYWNY';
-
-                      return (
-                        <div
-                          key={p.id}
-                          style={{
-                            borderRadius: 12,
-                            border: '1px solid rgba(255,255,255,0.10)',
-                            padding: '10px 12px',
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: 10,
-                            background: 'rgba(3,7,18,0.55)',
-                          }}
-                        >
-                          <div
-                            style={{
-                              width: 12,
-                              height: 12,
-                              borderRadius: 999,
-                              background: COLOR_HEX[p.colorKey || 'blue'] || '#94a3b8',
-                              border: '1px solid rgba(255,255,255,0.35)',
-                              flex: '0 0 auto',
-                            }}
-                          />
-                          <div style={{ fontWeight: 900, flex: '1 1 auto' }}>
-                            {p.nickname}
-                            {p.id === hostId ? ' (Host)' : ''}
-                          </div>
-                          <div style={{ opacity: 0.9, fontSize: 13 }}>Saldo: {p.balance}</div>
-                          <div
-                            style={{
-                              fontSize: 12,
-                              fontWeight: 900,
-                              padding: '4px 8px',
-                              borderRadius: 999,
-                              border: '1px solid rgba(255,255,255,0.12)',
-                              background: isW ? 'rgba(34,197,94,0.15)' : isB ? 'rgba(239,68,68,0.15)' : 'rgba(148,163,184,0.10)',
-                            }}
-                          >
-                            {badge}
-                          </div>
+                  <div style={{ marginTop: 12 }}>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                      <div style={{ borderRadius: 12, border: '1px solid rgba(255,255,255,0.10)', background: 'rgba(2,6,23,0.55)', padding: 10 }}>
+                        <div className="muted" style={{ fontSize: 12 }}>Podsumowanie gry</div>
+                        <div style={{ marginTop: 6, fontWeight: 900, fontSize: 13 }}>
+                          Gracze: {summaryCounts.total} • Bankruci: {summaryCounts.bankrupt} • Offline: {summaryCounts.offline}
                         </div>
-                      );
-                    })}
-                  </div>
+                      </div>
 
-                  <div style={{ marginTop: 14, display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
-                    {isHost ? (
-                      <button type="button" onClick={handleRestartGame} style={{ width: 'auto', padding: '10px 14px', marginTop: 0 }}>
-                        Nowa gra
-                      </button>
-                    ) : (
-                      <div style={{ opacity: 0.8, fontSize: 13, alignSelf: 'center' }}>Oczekiwanie na hosta: Nowa gra</div>
-                    )}
+                      <div style={{ borderRadius: 12, border: '1px solid rgba(255,255,255,0.10)', background: 'rgba(2,6,23,0.55)', padding: 10 }}>
+                        <div className="muted" style={{ fontSize: 12 }}>Akcja</div>
+                        <div style={{ marginTop: 6, fontWeight: 900, fontSize: 13 }}>
+                          {isHost ? 'Host może uruchomić nową grę.' : 'Oczekiwanie na hosta.'}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div style={{ marginTop: 12, borderRadius: 12, border: '1px solid rgba(255,255,255,0.10)', background: 'rgba(3,7,18,0.55)', padding: 10 }}>
+                      <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>Gracze</div>
+
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                        {winnerPlayers.map((p) => {
+                          const status = getPlayerStatusLabel(p);
+                          const dot = COLOR_HEX[p.colorKey || 'blue'] || '#94a3b8';
+
+                          return (
+                            <div
+                              key={p.id}
+                              style={{
+                                display: 'grid',
+                                gridTemplateColumns: '14px 1fr auto',
+                                gap: 10,
+                                alignItems: 'center',
+                                padding: '10px 10px',
+                                borderRadius: 10,
+                                border: '1px solid rgba(255,255,255,0.10)',
+                                background: p.id === winnerId ? 'rgba(34,197,94,0.10)' : 'rgba(2,6,23,0.45)',
+                              }}
+                            >
+                              <div style={{ width: 10, height: 10, borderRadius: 999, background: dot, border: '1px solid rgba(255,255,255,0.55)' }} />
+
+                              <div style={{ minWidth: 0 }}>
+                                <div style={{ fontWeight: 950, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                  {p.nickname}{p.id === hostId ? ' (Host)' : ''}{p.id === winnerId ? ' (Winner)' : ''}
+                                </div>
+                                <div className="muted" style={{ fontSize: 12, marginTop: 2 }}>
+                                  Status: <span style={{ opacity: 0.95 }}>{status}</span>
+                                </div>
+                              </div>
+
+                              <div style={{ textAlign: 'right' }}>
+                                <div className="muted" style={{ fontSize: 12 }}>Saldo</div>
+                                <div style={{ fontWeight: 950, fontSize: 13 }}>{Number(p.balance || 0)}</div>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    <div style={{ marginTop: 14, display: 'flex', gap: 10, justifyContent: 'flex-end', alignItems: 'center' }}>
+                      {isHost ? (
+                        <button type="button" onClick={handleRestartGame} style={{ width: 'auto', padding: '10px 14px', marginTop: 0 }}>
+                          Nowa gra
+                        </button>
+                      ) : (
+                        <div className="muted">Oczekiwanie na hosta: Nowa gra</div>
+                      )}
+                    </div>
                   </div>
                 </div>
               </div>
             )}
 
-            {/* LEFT */}
             <div className="left-stack">
               <div className="panel">
                 <div className="panel-title">Gracze</div>
-
                 <div className="players-list">
                   {gameState.players.map((p) => {
                     const isCurrent = gameState.currentPlayerId === p.id;
-                    const isMe = socketId === p.id;
+                    const isMeLocal = socketId === p.id;
 
                     const cls = [
                       'player-card',
                       `player-owned--${p.colorKey || 'blue'}`,
                       isCurrent ? 'player-card--current' : '',
-                      isMe ? 'player-card--me' : '',
-                    ].filter(Boolean).join(' ');
+                      isMeLocal ? 'player-card--me' : '',
+                    ]
+                      .filter(Boolean)
+                      .join(' ');
 
-                    const showTimer = Boolean(isCurrent && !gameOver && currentTurnTimerText);
+                    const showTimer = Boolean(isCurrent && !gameOver && currentTurnTimerTextMemo);
                     const timerStyle = {
                       fontSize: 12,
                       fontWeight: 950,
@@ -1453,12 +1592,8 @@ export default function App() {
                           <div className="player-card-name">
                             {p.nickname}{p.id === hostId ? ' (Host)' : ''}
                           </div>
-
-                          <div style={timerStyle}>
-                            {showTimer ? currentTurnTimerText : '--:--'}
-                          </div>
+                          <div style={timerStyle}>{showTimer ? currentTurnTimerTextMemo : '--:--'}</div>
                         </div>
-
                         <div className="player-card-meta">Saldo: {p.balance}</div>
                         <div className="player-card-meta">Pole: {animatedPositions[p.id] ?? p.position}</div>
                         {p.isDisconnected ? <div className="player-card-meta">Status: OFFLINE</div> : null}
@@ -1472,17 +1607,12 @@ export default function App() {
 
               <div className="panel">
                 <div className="panel-title">Sterowanie</div>
-
                 <div className="controls-grid">
-                  <div className="small-line">
-                    <strong>Tura gracza:</strong> {currentPlayer ? currentPlayer.nickname : '-'}
+                  <div className="small-line"><strong>Tura gracza:</strong> {currentPlayer ? currentPlayer.nickname : '-'}</div>
+                  <div className="small-line"><strong>Twoja tura:</strong> {isMyTurn ? 'TAK' : 'NIE'}</div>
+                  <div className="muted" style={{ fontSize: 12, lineHeight: 1.5 }}>
+                    Ulepszenia: kliknij swoją nieruchomość (pełny set) przed rzutem kośćmi.
                   </div>
-                  <div className="small-line">
-                    <strong>Twoja tura:</strong> {isMyTurn ? 'TAK' : 'NIE'}
-                  </div>
-
-                  {gameOver && winner && <div className="hud-toast hud-toast--ok">Zwycięzca: {winner.nickname}</div>}
-
                   <div className="controls-row">
                     <button
                       onClick={handleRollDice}
@@ -1495,6 +1625,7 @@ export default function App() {
                         Boolean(jailModal) ||
                         Boolean(paymentModal) ||
                         Boolean(buyModalOpen) ||
+                        Boolean(upgradeModalTileId) ||
                         gameState.phase !== 'awaiting_roll'
                       }
                       type="button"
@@ -1502,27 +1633,10 @@ export default function App() {
                       Rzuć kośćmi
                     </button>
                   </div>
-
-                  <div className="muted" style={{ fontSize: 12, lineHeight: 1.5 }}>
-                    Zakup pola odbywa się w osobnym oknie. Ten panel zostanie później użyty do negocjacji (trade).
-                  </div>
-
-                  {toast && (
-                    <div className={'hud-toast ' + (toast.type === 'ok' ? 'hud-toast--ok' : 'hud-toast--err')}>
-                      {toast.text}
-                    </div>
-                  )}
-
-                  {diceInfo && (
-                    <div className="small-line">
-                      Ostatni rzut: {diceInfo.nickname} → {diceInfo.dice1}+{diceInfo.dice2}={diceInfo.steps}, pole {diceInfo.newPosition} ({diceInfo.tile.name})
-                    </div>
-                  )}
                 </div>
               </div>
             </div>
 
-            {/* CENTER */}
             <div className="board-wrap">
               <div className="board-classic">
                 <div className="corner tl">{renderTile(tl, 'top', 'tile-corner')}</div>
@@ -1542,7 +1656,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* RIGHT */}
             <div className="activity-panel">
               <div className="activity-tabs">
                 <button
@@ -1593,12 +1706,16 @@ export default function App() {
                       if (e.key === 'Enter') handleSendMessage();
                     }}
                   />
-                  <button onClick={handleSendMessage} type="button">
-                    Wyślij
-                  </button>
+                  <button onClick={handleSendMessage} type="button">Wyślij</button>
                 </div>
               )}
             </div>
+          </div>
+        )}
+
+        {toast && (
+          <div className={'floating-toast ' + (toast.type === 'ok' ? 'floating-toast--ok' : 'floating-toast--err')}>
+            {toast.text}
           </div>
         )}
       </div>

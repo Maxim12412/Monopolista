@@ -1,4 +1,5 @@
 require('dotenv').config();
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -15,12 +16,52 @@ const io = new Server(server, {
   cors: { origin: true, methods: ['GET', 'POST'], credentials: true },
 });
 
-// ===== Timers / AFK policy =====
-const TURN_TIMEOUT_MS = 60 * 1000; // 60s for any player
-const DISCONNECT_GRACE_MS = 90 * 1000; // 90s for disconnected player on their turn
+/* === Konfiguracja === */
+
+const TURN_TIMEOUT_MS = 60 * 1000;
+const DISCONNECT_GRACE_MS = 90 * 1000;
 const DISCONNECT_MAX_MISSED_TURNS = 3;
 
-// ===== MongoDB (persistence) =====
+const START_BONUS = 200;
+const START_BONUS_LIMIT_LAPS = 30;
+
+const HOUSE_MAX = 4;
+const JAIL_TILE_ID = 10;
+const JAIL_FINE = 50;
+
+function getUpgradeCost(tile) {
+  const price = Number(tile?.price || 0);
+  return Math.max(50, Math.round(price * 0.5));
+}
+
+/* === Narzędzia pomocnicze === */
+
+const PLAYER_COLORS = ['blue', 'yellow', 'red', 'green', 'pink'];
+
+function normalizeNickname(name) {
+  return String(name || '').trim().toLowerCase();
+}
+
+function pickNextColor(room) {
+  const used = new Set((room.players || []).map((p) => p.colorKey));
+  const next = PLAYER_COLORS.find((c) => !used.has(c));
+  return next || 'blue';
+}
+
+function isBuyable(tile) {
+  return tile && (tile.type === 'property' || tile.type === 'station' || tile.type === 'utility');
+}
+
+function clamp(n, a, b) {
+  return Math.max(a, Math.min(b, n));
+}
+
+function safeClone(obj) {
+  return JSON.parse(JSON.stringify(obj));
+}
+
+/* === MongoDB (opcjonalnie) === */
+
 const MONGODB_URI = process.env.MONGODB_URI || '';
 
 const RoomStateSchema = new mongoose.Schema(
@@ -35,7 +76,7 @@ const RoomState = mongoose.model('RoomState', RoomStateSchema);
 
 async function connectMongo() {
   if (!MONGODB_URI) {
-    console.warn('[MongoDB] MONGODB_URI is missing. Persistence is disabled.');
+    console.warn('[MongoDB] MONGODB_URI missing. Persistence disabled.');
     return;
   }
   try {
@@ -48,10 +89,6 @@ async function connectMongo() {
 
 function isMongoReady() {
   return mongoose.connection?.readyState === 1;
-}
-
-function safeClone(obj) {
-  return JSON.parse(JSON.stringify(obj));
 }
 
 function roomToPersisted(room) {
@@ -71,6 +108,7 @@ function roomToPersisted(room) {
       isDisconnected: Boolean(p.isDisconnected),
       disconnectedAt: p.disconnectedAt ? Number(p.disconnectedAt) : null,
       missedTurnsWhileDisconnected: Number(p.missedTurnsWhileDisconnected || 0),
+      lapsCompleted: Number(p.lapsCompleted || 0),
     })),
     status: room.status,
     currentPlayerIndex: room.currentPlayerIndex,
@@ -80,9 +118,9 @@ function roomToPersisted(room) {
     winnerId: room.winnerId || null,
     board: room.board,
     chanceDeck: room.chanceDeck || [],
-    chancePos: room.chancePos || 0,
+    chancePos: Number(room.chancePos || 0),
     communityDeck: room.communityDeck || [],
-    communityPos: room.communityPos || 0,
+    communityPos: Number(room.communityPos || 0),
     logHistory: room.logHistory || [],
   };
 }
@@ -128,8 +166,8 @@ function scheduleSave(roomCode) {
   const room = rooms[roomCode];
   if (!room) return;
   if (!isMongoReady()) return;
-
   if (room._saveTimer) return;
+
   room._saveTimer = setTimeout(async () => {
     room._saveTimer = null;
     await saveRoomNow(roomCode);
@@ -152,24 +190,8 @@ async function deleteRoomFromDb(roomCode) {
   }
 }
 
-// ===== Player colors =====
-const PLAYER_COLORS = ['blue', 'yellow', 'red', 'green'];
+/* === Dane: plansza i karty === */
 
-function pickNextColor(room) {
-  const used = new Set((room.players || []).map((p) => p.colorKey));
-  const next = PLAYER_COLORS.find((c) => !used.has(c));
-  return next || 'blue';
-}
-
-function isBuyable(tile) {
-  return tile && (tile.type === 'property' || tile.type === 'station' || tile.type === 'utility');
-}
-
-function clamp(n, a, b) {
-  return Math.max(a, Math.min(b, n));
-}
-
-// ===== Board base (Warsaw) =====
 const BOARD_TILES = [
   { id: 0, type: 'start', name: 'START' },
 
@@ -187,14 +209,14 @@ const BOARD_TILES = [
   { id: 10, type: 'jail', name: 'Więzienie / tylko z wizytą' },
 
   { id: 11, type: 'property', name: 'Płowiecka', price: 140, group: 'pink', setSize: 3, rentLevels: [10, 20, 30] },
-  { id: 12, type: 'utility', name: 'Elektrownia', price: 150 },
+  { id: 12, type: 'utility', name: 'Prąd', price: 150 },
   { id: 13, type: 'property', name: 'Marsa', price: 140, group: 'pink', setSize: 3, rentLevels: [10, 20, 30] },
-  { id: 14, type: 'property', name: 'Grochowska', price: 160, group: 'pink', setSize: 3, rentLevels: [12, 24, 36] },
+  { id: 14, type: 'property', name: 'Żurawia', price: 160, group: 'pink', setSize: 3, rentLevels: [12, 24, 36] },
   { id: 15, type: 'station', name: 'Dworzec Gdański', price: 200, rent: 25 },
 
   { id: 16, type: 'property', name: 'Obozowa', price: 180, group: 'orange', setSize: 3, rentLevels: [14, 28, 42] },
   { id: 17, type: 'chest', name: 'Kasa społeczna' },
-  { id: 18, type: 'property', name: 'Górczewska', price: 180, group: 'orange', setSize: 3, rentLevels: [14, 28, 42] },
+  { id: 18, type: 'property', name: 'Inflancka', price: 180, group: 'orange', setSize: 3, rentLevels: [14, 28, 42] },
   { id: 19, type: 'property', name: 'Wolska', price: 200, group: 'orange', setSize: 3, rentLevels: [16, 32, 48] },
 
   { id: 20, type: 'parking', name: 'Bezpłatny parking' },
@@ -202,32 +224,29 @@ const BOARD_TILES = [
   { id: 21, type: 'property', name: 'Mickiewicza', price: 220, group: 'red', setSize: 3, rentLevels: [18, 36, 54] },
   { id: 22, type: 'random', name: 'Szansa' },
   { id: 23, type: 'property', name: 'Słowackiego', price: 220, group: 'red', setSize: 3, rentLevels: [18, 36, 54] },
-  { id: 24, type: 'property', name: 'Plac Wilsona', price: 240, group: 'red', setSize: 3, rentLevels: [20, 40, 60] },
+  { id: 24, type: 'property', name: 'Pl. Bankowy', price: 240, group: 'red', setSize: 3, rentLevels: [20, 40, 60] },
   { id: 25, type: 'station', name: 'Dworzec Wschodni', price: 200, rent: 25 },
 
-  { id: 26, type: 'property', name: 'Świętokrzyska', price: 260, group: 'yellow', setSize: 3, rentLevels: [22, 44, 66] },
-  { id: 27, type: 'property', name: 'Krakowskie Przedmieście', price: 260, group: 'yellow', setSize: 3, rentLevels: [22, 44, 66] },
-  { id: 28, type: 'utility', name: 'Wodociągi', price: 150 },
-  { id: 29, type: 'property', name: 'Nowy Świat', price: 280, group: 'yellow', setSize: 3, rentLevels: [24, 48, 72] },
+  { id: 26, type: 'property', name: 'Mazowiecka', price: 260, group: 'yellow', setSize: 3, rentLevels: [22, 44, 66] },
+  { id: 27, type: 'property', name: 'Tamka', price: 260, group: 'yellow', setSize: 3, rentLevels: [22, 44, 66] },
+  { id: 28, type: 'utility', name: 'Woda', price: 150 },
+  { id: 29, type: 'property', name: 'Bracka', price: 280, group: 'yellow', setSize: 3, rentLevels: [24, 48, 72] },
 
   { id: 30, type: 'go_to_jail', name: 'Idź do więzienia' },
 
-  { id: 31, type: 'property', name: 'Plac Trzech Krzyży', price: 300, group: 'green', setSize: 3, rentLevels: [26, 52, 78] },
-  { id: 32, type: 'property', name: 'Marszałkowska', price: 300, group: 'green', setSize: 3, rentLevels: [26, 52, 78] },
+  { id: 31, type: 'property', name: 'Pl. Zbawiciela', price: 300, group: 'green', setSize: 3, rentLevels: [26, 52, 78] },
+  { id: 32, type: 'property', name: 'Chmielna', price: 300, group: 'green', setSize: 3, rentLevels: [26, 52, 78] },
   { id: 33, type: 'chest', name: 'Kasa społeczna' },
-  { id: 34, type: 'property', name: 'Aleje Jerozolimskie', price: 320, group: 'green', setSize: 3, rentLevels: [28, 56, 84] },
+  { id: 34, type: 'property', name: 'Puławska', price: 320, group: 'green', setSize: 3, rentLevels: [28, 56, 84] },
+
   { id: 35, type: 'station', name: 'Dworzec Centralny', price: 200, rent: 25 },
 
   { id: 36, type: 'random', name: 'Szansa' },
-  { id: 37, type: 'property', name: 'Belwederska', price: 350, group: 'darkblue', setSize: 2, rentLevels: [35, 70] },
+  { id: 37, type: 'property', name: 'Solec', price: 350, group: 'darkblue', setSize: 2, rentLevels: [35, 70] },
   { id: 38, type: 'tax', name: 'Domiar podatkowy', amount: 100 },
-  { id: 39, type: 'property', name: 'Aleje Ujazdowskie', price: 400, group: 'darkblue', setSize: 2, rentLevels: [50, 100] },
+  { id: 39, type: 'property', name: 'Koszykowa', price: 400, group: 'darkblue', setSize: 2, rentLevels: [50, 100] },
 ];
 
-const JAIL_TILE_ID = 10;
-const JAIL_FINE = 50;
-
-// ===== Cards (same as before) =====
 const CHANCE_CARDS = [
   { id: 'ch_1', text: 'Otrzymujesz +200.', effect: { type: 'money', amount: 200 } },
   { id: 'ch_2', text: 'Otrzymujesz +25.', effect: { type: 'money', amount: 25 } },
@@ -235,7 +254,7 @@ const CHANCE_CARDS = [
   { id: 'ch_4', text: 'Przesuń się o +3 pola.', effect: { type: 'moveSteps', steps: 3 } },
   { id: 'ch_5', text: 'Cofnij się o -2 pola.', effect: { type: 'moveSteps', steps: -2 } },
   { id: 'ch_6', text: 'Idź do więzienia.', effect: { type: 'goToJail' } },
-  { id: 'ch_7', text: 'Idź na START (możesz otrzymać +200 za przejście przez START).', effect: { type: 'moveTo', tileId: 0 } },
+  { id: 'ch_7', text: 'Idź na START (bonus za przejście przez START).', effect: { type: 'moveTo', tileId: 0 } },
   { id: 'ch_8', text: 'Idź na "Dworzec Centralny".', effect: { type: 'moveTo', tileId: 35 } },
 ];
 
@@ -258,10 +277,15 @@ function shuffleArray(arr) {
   return a;
 }
 
+/* === Pokoje w pamięci === */
+
 const rooms = {};
 
 function createRoomBoard() {
-  return BOARD_TILES.map((t) => ({ ...t, ownerId: null }));
+  return BOARD_TILES.map((t) => {
+    if (t.type === 'property') return { ...t, ownerId: null, houses: 0, hasHotel: false };
+    return { ...t, ownerId: null };
+  });
 }
 
 function createPlayer(socketId, nickname, colorKey) {
@@ -278,8 +302,49 @@ function createPlayer(socketId, nickname, colorKey) {
     isDisconnected: false,
     disconnectedAt: null,
     missedTurnsWhileDisconnected: 0,
+    lapsCompleted: 0,
   };
 }
+
+function normalizeRoom(room) {
+  if (!room) return;
+
+  if (!Array.isArray(room.players)) room.players = [];
+  if (!Array.isArray(room.board)) room.board = [];
+  if (!Array.isArray(room.logHistory)) room.logHistory = [];
+
+  room.players.forEach((p) => {
+    if (p.lapsCompleted === undefined) p.lapsCompleted = 0;
+    if (p.missedTurnsWhileDisconnected === undefined) p.missedTurnsWhileDisconnected = 0;
+    if (p.isDisconnected === undefined) p.isDisconnected = false;
+    if (p.disconnectedAt === undefined) p.disconnectedAt = null;
+  });
+
+  room.board.forEach((t) => {
+    if (t.type === 'property') {
+      if (t.houses === undefined) t.houses = 0;
+      if (t.hasHotel === undefined) t.hasHotel = false;
+    }
+  });
+
+  if (!room.readyById) room.readyById = {};
+  if (!Array.isArray(room.chanceDeck)) room.chanceDeck = [];
+  if (!Array.isArray(room.communityDeck)) room.communityDeck = [];
+  if (!Number.isFinite(room.chancePos)) room.chancePos = 0;
+  if (!Number.isFinite(room.communityPos)) room.communityPos = 0;
+  if (!room.status) room.status = 'waiting';
+  if (!Number.isFinite(room.currentPlayerIndex)) room.currentPlayerIndex = 0;
+  if (!room.phase) room.phase = 'awaiting_roll';
+  if (room.pending === undefined) room.pending = null;
+  if (!room.hostId) room.hostId = null;
+
+  room._saveTimer = null;
+  room._turnTimer = null;
+  room._turnTimerForPlayerId = null;
+  room._turnTimerMs = null;
+}
+
+/* === Emit i log === */
 
 function snapshotRoom(room) {
   return {
@@ -300,11 +365,11 @@ function appendLog(roomCode, text) {
   const room = rooms[roomCode];
   if (!room) return;
 
-  if (!Array.isArray(room.logHistory)) room.logHistory = [];
-  room.logHistory.push({ ts: Date.now(), text });
+  const entry = { ts: Date.now(), text };
+  room.logHistory.push(entry);
   if (room.logHistory.length > 250) room.logHistory = room.logHistory.slice(-250);
 
-  io.to(roomCode).emit('gameLogEvent', { ts: Date.now(), text });
+  io.to(roomCode).emit('gameLogEvent', entry);
   scheduleSave(roomCode);
 }
 
@@ -314,8 +379,8 @@ function emitToastToPlayer(playerId, payload) {
 
 function emitPaymentPromptToPlayer(playerId, payload) {
   io.to(playerId).emit('paymentPrompt', payload);
-  io.to(playerId).emit('payment_prompt', payload);
 }
+/* === Timery tury === */
 
 function clearTurnTimer(room) {
   if (!room) return;
@@ -366,7 +431,9 @@ function emitGameState(roomCode) {
     phase: room.phase,
     pending: room.pending,
     gameOver: Boolean(room.gameOver),
-    winner: winnerPlayer ? { id: winnerPlayer.id, nickname: winnerPlayer.nickname, colorKey: winnerPlayer.colorKey } : null,
+    winner: winnerPlayer
+      ? { id: winnerPlayer.id, nickname: winnerPlayer.nickname, colorKey: winnerPlayer.colorKey }
+      : null,
     players: room.players.map((p) => ({
       id: p.id,
       nickname: p.nickname,
@@ -378,6 +445,7 @@ function emitGameState(roomCode) {
       jailTurnsLeft: Number(p.jailTurnsLeft || 0),
       isDisconnected: Boolean(p.isDisconnected),
       missedTurnsWhileDisconnected: Number(p.missedTurnsWhileDisconnected || 0),
+      lapsCompleted: Number(p.lapsCompleted || 0),
     })),
     currentPlayerId: current ? current.id : null,
     board: room.board,
@@ -386,6 +454,8 @@ function emitGameState(roomCode) {
   scheduleSave(roomCode);
   scheduleTurnTimer(roomCode);
 }
+
+/* === Tury / gracze === */
 
 function allReady(room) {
   if (!room || room.players.length < 2) return false;
@@ -400,15 +470,44 @@ function getActivePlayers(room) {
   return room.players.filter((p) => !p.isBankrupt);
 }
 
-// ===== Rent helpers =====
+function ensureCurrentIsActive(room) {
+  if (!room || room.players.length === 0) return;
+
+  const triesMax = room.players.length;
+  let tries = 0;
+
+  while (tries < triesMax && room.players[room.currentPlayerIndex]?.isBankrupt) {
+    room.currentPlayerIndex = (room.currentPlayerIndex + 1) % room.players.length;
+    tries += 1;
+  }
+}
+
+function advanceTurn(room) {
+  if (!room || room.players.length === 0) return;
+  room.currentPlayerIndex = (room.currentPlayerIndex + 1) % room.players.length;
+  ensureCurrentIsActive(room);
+}
+
+/* === Czynsz === */
+
 function countOwnerStations(room, ownerId) {
   return room.board.filter((t) => t.type === 'station' && t.ownerId === ownerId).length;
 }
+
 function countOwnerUtilities(room, ownerId) {
   return room.board.filter((t) => t.type === 'utility' && t.ownerId === ownerId).length;
 }
+
 function countOwnerGroupProps(room, ownerId, group) {
   return room.board.filter((t) => t.type === 'property' && t.group === group && t.ownerId === ownerId).length;
+}
+
+function hasMonopoly(room, ownerId, tile) {
+  if (!tile || tile.type !== 'property') return false;
+  const setSize = Number(tile.setSize || 0);
+  if (!setSize) return false;
+  const owned = countOwnerGroupProps(room, ownerId, tile.group);
+  return owned >= setSize;
 }
 
 function computeRent(room, tile, diceSum) {
@@ -416,8 +515,18 @@ function computeRent(room, tile, diceSum) {
 
   if (tile.type === 'property') {
     const ownedInGroup = countOwnerGroupProps(room, tile.ownerId, tile.group);
-    const idx = clamp(ownedInGroup, 1, tile.rentLevels.length) - 1;
-    return Number(tile.rentLevels[idx] || 0);
+    const levels = Array.isArray(tile.rentLevels) ? tile.rentLevels : [];
+    if (levels.length === 0) return 0;
+
+    const idx = clamp(ownedInGroup, 1, levels.length) - 1;
+    const base = Number(levels[idx] || 0);
+
+    const houses = Number(tile.houses || 0);
+    const hasHotelFlag = Boolean(tile.hasHotel);
+
+    if (hasHotelFlag) return Math.max(0, Math.round(base * 6));
+    if (houses > 0) return Math.max(0, Math.round(base * (1 + houses)));
+    return base;
   }
 
   if (tile.type === 'station') {
@@ -436,30 +545,120 @@ function computeRent(room, tile, diceSum) {
   return 0;
 }
 
-// ===== Turn helpers =====
-function ensureCurrentIsActive(room) {
-  if (room.players.length === 0) return;
+/* === START bonus === */
 
-  const triesMax = room.players.length;
-  let tries = 0;
+function applyStartPass(roomCode, player, reasonLabel) {
+  const prev = Number(player.lapsCompleted || 0);
+  player.lapsCompleted = prev + 1;
 
-  // IMPORTANT: do NOT skip disconnected players; only skip bankrupt
-  while (tries < triesMax && room.players[room.currentPlayerIndex]?.isBankrupt) {
-    room.currentPlayerIndex = (room.currentPlayerIndex + 1) % room.players.length;
-    tries += 1;
+  if (prev < START_BONUS_LIMIT_LAPS) {
+    player.balance += START_BONUS;
+    appendLog(roomCode, `${player.nickname} przeszedł przez START i otrzymał +${START_BONUS}. (${reasonLabel})`);
+    emitToastToPlayer(player.id, { type: 'ok', text: `START: +${START_BONUS}` });
+  } else {
+    appendLog(roomCode, `${player.nickname} przeszedł przez START, ale limit bonusu został osiągnięty. (${reasonLabel})`);
+    emitToastToPlayer(player.id, { type: 'err', text: 'START: 0 (limit)' });
   }
 }
 
-function advanceTurn(room) {
-  if (room.players.length === 0) return;
-  room.currentPlayerIndex = (room.currentPlayerIndex + 1) % room.players.length;
-  ensureCurrentIsActive(room);
+/* === Ruch (animacja) === */
+
+function buildForwardPath(startPos, steps, len) {
+  const path = [];
+  let pos = startPos;
+  for (let i = 0; i < steps; i += 1) {
+    pos = (pos + 1) % len;
+    path.push(pos);
+  }
+  return path;
 }
 
-// ===== Bankruptcy / Winner =====
+function buildBackwardPath(startPos, stepsAbs, len) {
+  const path = [];
+  let pos = startPos;
+  for (let i = 0; i < stepsAbs; i += 1) {
+    pos = (pos - 1 + len) % len;
+    path.push(pos);
+  }
+  return path;
+}
+
+function buildPathToForward(startPos, targetPos, len) {
+  const path = [];
+  let pos = startPos;
+  while (pos !== targetPos) {
+    pos = (pos + 1) % len;
+    path.push(pos);
+    if (path.length > len + 2) break;
+  }
+  return path;
+}
+
+/* === Talia kart === */
+
+function initDecks(room) {
+  room.chanceDeck = shuffleArray(CHANCE_CARDS);
+  room.chancePos = 0;
+
+  room.communityDeck = shuffleArray(COMMUNITY_CARDS);
+  room.communityPos = 0;
+}
+
+function drawCard(room, deckType) {
+  const isChance = deckType === 'chance';
+  const deck = isChance ? room.chanceDeck : room.communityDeck;
+  let pos = isChance ? room.chancePos : room.communityPos;
+
+  if (!Array.isArray(deck) || deck.length === 0) return null;
+  if (pos >= deck.length) pos = 0;
+
+  const card = deck[pos];
+  pos += 1;
+
+  if (isChance) room.chancePos = pos;
+  else room.communityPos = pos;
+
+  return card || null;
+}
+
+/* === Więzienie === */
+
+function sendToJail(roomCode, room, player, reason = 'jail') {
+  player.position = JAIL_TILE_ID;
+  player.inJail = true;
+  player.jailTurnsLeft = 1;
+
+  io.to(roomCode).emit('playerMovePath', { playerId: player.id, path: [JAIL_TILE_ID], reason });
+
+  appendLog(roomCode, `${player.nickname} idzie do więzienia.`);
+  emitToastToPlayer(player.id, { type: 'err', text: 'Więzienie' });
+}
+
+function maybePromptJail(roomCode, room, player) {
+  if (!player.inJail || player.jailTurnsLeft <= 0) return false;
+
+  room.phase = 'awaiting_jail_choice';
+  room.pending = { type: 'jail', playerId: player.id, fine: JAIL_FINE };
+
+  emitGameState(roomCode);
+
+  io.to(player.id).emit('jailPrompt', { playerId: player.id, fine: JAIL_FINE });
+
+  appendLog(roomCode, `${player.nickname} jest w więzieniu: wybór (zapłać ${JAIL_FINE} lub pomiń turę).`);
+  return true;
+}
+
+/* === Bankructwo / zwycięzca / reset === */
+
 function releasePropertiesToBank(room, playerId) {
   room.board.forEach((t) => {
-    if (t.ownerId === playerId) t.ownerId = null;
+    if (t.ownerId === playerId) {
+      t.ownerId = null;
+      if (t.type === 'property') {
+        t.houses = 0;
+        t.hasHotel = false;
+      }
+    }
   });
 }
 
@@ -519,89 +718,98 @@ function handleBankruptcy(roomCode, playerId) {
   return markBankrupt(roomCode, playerId, null);
 }
 
-// ===== Movement paths (animation) =====
-function buildForwardPath(startPos, steps, len) {
-  const path = [];
-  let pos = startPos;
-  for (let i = 0; i < steps; i += 1) {
-    pos = (pos + 1) % len;
-    path.push(pos);
-  }
-  return path;
-}
+function resetGame(roomCode) {
+  const room = rooms[roomCode];
+  if (!room) return;
 
-function buildBackwardPath(startPos, stepsAbs, len) {
-  const path = [];
-  let pos = startPos;
-  for (let i = 0; i < stepsAbs; i += 1) {
-    pos = (pos - 1 + len) % len;
-    path.push(pos);
-  }
-  return path;
-}
+  clearTurnTimer(room);
 
-function buildPathToForward(startPos, targetPos, len) {
-  const path = [];
-  let pos = startPos;
-  while (pos !== targetPos) {
-    pos = (pos + 1) % len;
-    path.push(pos);
-    if (path.length > len + 2) break;
-  }
-  return path;
-}
+  room.board = createRoomBoard();
+  room.phase = 'awaiting_roll';
+  room.pending = null;
+  room.currentPlayerIndex = 0;
+  room.gameOver = false;
+  room.winnerId = null;
 
-// ===== Deck helpers =====
-function initDecks(room) {
-  room.chanceDeck = shuffleArray(CHANCE_CARDS);
-  room.chancePos = 0;
-  room.communityDeck = shuffleArray(COMMUNITY_CARDS);
-  room.communityPos = 0;
-}
+  room.players.forEach((p) => {
+    p.position = 0;
+    p.balance = 1500;
+    p.properties = [];
+    p.isBankrupt = false;
+    p.inJail = false;
+    p.jailTurnsLeft = 0;
+    p.isDisconnected = false;
+    p.disconnectedAt = null;
+    p.missedTurnsWhileDisconnected = 0;
+    p.lapsCompleted = 0;
+  });
 
-function drawCard(room, deckType) {
-  const isChance = deckType === 'chance';
-  const deck = isChance ? room.chanceDeck : room.communityDeck;
-  let pos = isChance ? room.chancePos : room.communityPos;
+  initDecks(room);
+  ensureCurrentIsActive(room);
 
-  if (!Array.isArray(deck) || deck.length === 0) return null;
-  if (pos >= deck.length) pos = 0;
-
-  const card = deck[pos];
-  pos += 1;
-
-  if (isChance) room.chancePos = pos;
-  else room.communityPos = pos;
-
-  return card || null;
-}
-
-// ===== Jail / landing =====
-function sendToJail(roomCode, room, player, reason = 'jail') {
-  player.position = JAIL_TILE_ID;
-  player.inJail = true;
-  player.jailTurnsLeft = 1;
-
-  io.to(roomCode).emit('playerMovePath', { playerId: player.id, path: [JAIL_TILE_ID], reason });
-
-  appendLog(roomCode, `${player.nickname} idzie do więzienia.`);
-  emitToastToPlayer(player.id, { type: 'err', text: 'Więzienie' });
-}
-
-function maybePromptJail(roomCode, room, player) {
-  if (!player.inJail || player.jailTurnsLeft <= 0) return false;
-
-  room.phase = 'awaiting_jail_choice';
-  room.pending = { type: 'jail', playerId: player.id, fine: JAIL_FINE };
-
+  io.to(roomCode).emit('gameReset');
+  appendLog(roomCode, `Nowa gra rozpoczęta. Pierwszy ruch: ${room.players[room.currentPlayerIndex]?.nickname || '-'}.`);
   emitGameState(roomCode);
-
-  io.to(player.id).emit('jailPrompt', { playerId: player.id, fine: JAIL_FINE });
-  io.to(player.id).emit('jail_prompt', { playerId: player.id, fine: JAIL_FINE });
-
-  appendLog(roomCode, `${player.nickname} jest w więzieniu: wybór (zapłać ${JAIL_FINE} lub pomiń turę).`);
-  return true;
+  scheduleSave(roomCode);
 }
+
+function rebindPlayerId(room, oldId, newId) {
+  if (!room || !oldId || !newId) return;
+
+  room.players.forEach((p) => {
+    if (p.id === oldId) p.id = newId;
+  });
+
+  if (room.hostId === oldId) room.hostId = newId;
+  if (room.winnerId === oldId) room.winnerId = newId;
+
+  if (room.readyById) {
+    const val = room.readyById[oldId];
+    delete room.readyById[oldId];
+    room.readyById[newId] = val;
+  }
+
+  if (Array.isArray(room.board)) {
+    room.board.forEach((t) => {
+      if (t.ownerId === oldId) t.ownerId = newId;
+    });
+  }
+
+  if (room.pending && room.pending.playerId === oldId) room.pending.playerId = newId;
+  if (room._turnTimerForPlayerId === oldId) room._turnTimerForPlayerId = newId;
+}
+
+/* === Ulepszenia === */
+
+function applyUpgrade(roomCode, room, player, tile) {
+  if (!tile || tile.type !== 'property') return { ok: false, error: 'NOT_PROPERTY' };
+  if (tile.ownerId !== player.id) return { ok: false, error: 'NOT_OWNER' };
+  if (!hasMonopoly(room, player.id, tile)) return { ok: false, error: 'NO_MONOPOLY' };
+
+  const houses = Number(tile.houses || 0);
+  const hasHotelFlag = Boolean(tile.hasHotel);
+
+  if (hasHotelFlag) return { ok: false, error: 'ALREADY_HOTEL' };
+
+  const cost = getUpgradeCost(tile);
+  if (player.balance < cost) return { ok: false, error: 'NO_MONEY' };
+
+  player.balance -= cost;
+
+  if (houses < HOUSE_MAX) {
+    tile.houses = houses + 1;
+    appendLog(roomCode, `${player.nickname} kupił domek (${tile.houses}/4) na polu ${tile.name} za ${cost}.`);
+    emitToastToPlayer(player.id, { type: 'ok', text: `Ulepszenie: ${tile.name} (-${cost})` });
+  } else {
+    tile.hasHotel = true;
+    appendLog(roomCode, `${player.nickname} kupił hotel na polu ${tile.name} za ${cost}.`);
+    emitToastToPlayer(player.id, { type: 'ok', text: `Hotel: ${tile.name} (-${cost})` });
+  }
+
+  return { ok: true };
+}
+
+/* === Rozliczenie wejścia na pole === */
 
 function resolveLanding(roomCode, room, player, diceSum, fromCard = false) {
   const tile = room.board[player.position];
@@ -669,8 +877,14 @@ function resolveLanding(roomCode, room, player, diceSum, fromCard = false) {
 
       emitGameState(roomCode);
 
-      io.to(player.id).emit('cardDrawn', { deckType, deckLabel, text: card.text, playerId: player.id, nickname: player.nickname, colorKey: player.colorKey });
-      io.to(player.id).emit('card_drawn', { deckType, deckLabel, text: card.text, playerId: player.id, nickname: player.nickname, colorKey: player.colorKey });
+      io.to(player.id).emit('cardDrawn', {
+        deckType,
+        deckLabel,
+        text: card.text,
+        playerId: player.id,
+        nickname: player.nickname,
+        colorKey: player.colorKey,
+      });
 
       return { phase: 'awaiting_card_ack', endedTurn: false };
     }
@@ -692,7 +906,8 @@ function resolveLanding(roomCode, room, player, diceSum, fromCard = false) {
   return { phase: 'awaiting_roll', endedTurn: true };
 }
 
-// ===== Card effect after ack (same logic as before) =====
+/* === Efekty kart po OK === */
+
 function applyCardEffectAfterAck(roomCode, room, player, pendingCard) {
   const card = pendingCard.card;
   const diceSum = Number(pendingCard.diceSum || 0);
@@ -704,7 +919,7 @@ function applyCardEffectAfterAck(roomCode, room, player, pendingCard) {
     room.pending = null;
     advanceTurn(room);
     emitGameState(roomCode);
-    return { phase: 'awaiting_roll', endedTurn: true };
+    return;
   }
 
   if (eff.type === 'money') {
@@ -726,14 +941,14 @@ function applyCardEffectAfterAck(roomCode, room, player, pendingCard) {
       advanceTurn(room);
       emitGameState(roomCode);
       checkWinner(roomCode);
-      return { phase: 'awaiting_roll', endedTurn: true };
+      return;
     }
 
     room.phase = 'awaiting_roll';
     room.pending = null;
     advanceTurn(room);
     emitGameState(roomCode);
-    return { phase: 'awaiting_roll', endedTurn: true };
+    return;
   }
 
   if (eff.type === 'goToJail') {
@@ -745,13 +960,17 @@ function applyCardEffectAfterAck(roomCode, room, player, pendingCard) {
     advanceTurn(room);
     emitGameState(roomCode);
     checkWinner(roomCode);
-    return { phase: 'awaiting_roll', endedTurn: true };
+    return;
   }
 
   if (eff.type === 'moveSteps') {
     const steps = Number(eff.steps || 0);
     const len = room.board.length;
     const startPos = player.position;
+
+    if (steps > 0 && startPos + steps >= len) {
+      applyStartPass(roomCode, player, 'karta');
+    }
 
     const path = steps >= 0 ? buildForwardPath(startPos, steps, len) : buildBackwardPath(startPos, Math.abs(steps), len);
 
@@ -761,7 +980,8 @@ function applyCardEffectAfterAck(roomCode, room, player, pendingCard) {
     }
 
     appendLog(roomCode, `Efekt: ${player.nickname} przesuwa się o ${steps} pola.`);
-    return resolveLanding(roomCode, room, player, diceSum, true);
+    resolveLanding(roomCode, room, player, diceSum, true);
+    return;
   }
 
   if (eff.type === 'moveTo') {
@@ -773,16 +993,15 @@ function applyCardEffectAfterAck(roomCode, room, player, pendingCard) {
     const path = buildPathToForward(startPos, target, len);
 
     if (target < startPos) {
-      player.balance += 200;
-      appendLog(roomCode, `${player.nickname} przeszedł przez START i otrzymał +200.`);
-      emitToastToPlayer(player.id, { type: 'ok', text: 'START: +200' });
+      applyStartPass(roomCode, player, 'karta');
     }
 
     player.position = target;
     io.to(roomCode).emit('playerMovePath', { playerId: player.id, path: path.length ? path : [target], reason: 'card' });
 
     appendLog(roomCode, `Efekt: ${player.nickname} idzie na pole: ${room.board[target]?.name || target}.`);
-    return resolveLanding(roomCode, room, player, diceSum, true);
+    resolveLanding(roomCode, room, player, diceSum, true);
+    return;
   }
 
   appendLog(roomCode, 'Efekt: nieznany.');
@@ -790,76 +1009,33 @@ function applyCardEffectAfterAck(roomCode, room, player, pendingCard) {
   room.pending = null;
   advanceTurn(room);
   emitGameState(roomCode);
-  return { phase: 'awaiting_roll', endedTurn: true };
 }
 
-function resetGame(roomCode) {
+/* === Auto-akcje / timeout === */
+
+function autoJailSkip(roomCode) {
   const room = rooms[roomCode];
-  if (!room) return;
+  if (!room || room.status !== 'playing' || room.gameOver) return;
 
-  clearTurnTimer(room);
+  const currentPlayer = room.players[room.currentPlayerIndex];
+  if (!currentPlayer || currentPlayer.isBankrupt) return;
 
-  room.board = createRoomBoard();
+  if (room.phase !== 'awaiting_jail_choice' || !room.pending || room.pending.type !== 'jail' || room.pending.playerId !== currentPlayer.id) return;
+
+  currentPlayer.jailTurnsLeft = Math.max(0, Number(currentPlayer.jailTurnsLeft || 0) - 1);
+  appendLog(roomCode, `${currentPlayer.nickname} (auto) zostaje w więzieniu i pomija turę.`);
+
+  if (currentPlayer.jailTurnsLeft <= 0) {
+    currentPlayer.inJail = false;
+    appendLog(roomCode, `${currentPlayer.nickname} wychodzi z więzienia.`);
+  }
+
   room.phase = 'awaiting_roll';
   room.pending = null;
-  room.currentPlayerIndex = 0;
-  room.gameOver = false;
-  room.winnerId = null;
-
-  room.players.forEach((p) => {
-    p.position = 0;
-    p.balance = 1500;
-    p.properties = [];
-    p.isBankrupt = false;
-    p.inJail = false;
-    p.jailTurnsLeft = 0;
-    p.isDisconnected = false;
-    p.disconnectedAt = null;
-    p.missedTurnsWhileDisconnected = 0;
-  });
-
-  initDecks(room);
-  ensureCurrentIsActive(room);
-
-  io.to(roomCode).emit('gameReset');
-  appendLog(roomCode, `Nowa gra rozpoczęta. Pierwszy ruch: ${room.players[room.currentPlayerIndex]?.nickname || '-'}.`);
+  advanceTurn(room);
   emitGameState(roomCode);
-  scheduleSave(roomCode);
 }
 
-// ===== Rebind socket id on rejoin =====
-function rebindPlayerId(room, oldId, newId) {
-  if (!room || !oldId || !newId) return;
-
-  room.players.forEach((p) => {
-    if (p.id === oldId) p.id = newId;
-  });
-
-  if (room.hostId === oldId) room.hostId = newId;
-  if (room.winnerId === oldId) room.winnerId = newId;
-
-  if (room.readyById) {
-    const val = room.readyById[oldId];
-    delete room.readyById[oldId];
-    room.readyById[newId] = val;
-  }
-
-  if (Array.isArray(room.board)) {
-    room.board.forEach((t) => {
-      if (t.ownerId === oldId) t.ownerId = newId;
-    });
-  }
-
-  if (room.pending && room.pending.playerId === oldId) {
-    room.pending.playerId = newId;
-  }
-
-  if (room._turnTimerForPlayerId === oldId) {
-    room._turnTimerForPlayerId = newId;
-  }
-}
-
-// ===== Auto-actions on timeout =====
 function autoSkipBuy(roomCode) {
   const room = rooms[roomCode];
   if (!room || room.status !== 'playing' || room.gameOver) return;
@@ -894,29 +1070,6 @@ function autoCardAck(roomCode) {
   applyCardEffectAfterAck(roomCode, room, currentPlayer, pendingCard);
 }
 
-function autoJailSkip(roomCode) {
-  const room = rooms[roomCode];
-  if (!room || room.status !== 'playing' || room.gameOver) return;
-
-  const currentPlayer = room.players[room.currentPlayerIndex];
-  if (!currentPlayer || currentPlayer.isBankrupt) return;
-
-  if (room.phase !== 'awaiting_jail_choice' || !room.pending || room.pending.type !== 'jail' || room.pending.playerId !== currentPlayer.id) return;
-
-  currentPlayer.jailTurnsLeft = Math.max(0, Number(currentPlayer.jailTurnsLeft || 0) - 1);
-  appendLog(roomCode, `${currentPlayer.nickname} (auto) zostaje w więzieniu i pomija turę.`);
-
-  if (currentPlayer.jailTurnsLeft <= 0) {
-    currentPlayer.inJail = false;
-    appendLog(roomCode, `${currentPlayer.nickname} wychodzi z więzienia.`);
-  }
-
-  room.phase = 'awaiting_roll';
-  room.pending = null;
-  advanceTurn(room);
-  emitGameState(roomCode);
-}
-
 function autoRollDice(roomCode) {
   const room = rooms[roomCode];
   if (!room || room.status !== 'playing' || room.gameOver) return;
@@ -948,20 +1101,18 @@ function autoRollDice(roomCode) {
 
   if (newPos >= len) {
     newPos = newPos % len;
-    currentPlayer.balance += 200;
-    appendLog(roomCode, `${currentPlayer.nickname} przeszedł przez START i otrzymał +200.`);
-    emitToastToPlayer(currentPlayer.id, { type: 'ok', text: 'START: +200' });
+    applyStartPass(roomCode, currentPlayer, 'kości (auto)');
   }
 
   currentPlayer.position = newPos;
   const tile = room.board[newPos];
 
   io.to(roomCode).emit('diceRolled', { playerId: currentPlayer.id, nickname: currentPlayer.nickname, dice1, dice2, steps, newPosition: newPos, tile });
+
   const path = buildForwardPath(oldPos, steps, len);
   io.to(roomCode).emit('playerMovePath', { playerId: currentPlayer.id, path, reason: 'dice' });
 
   appendLog(roomCode, `${currentPlayer.nickname} (auto) rzucił ${dice1}+${dice2}=${steps} → ${tile.name}.`);
-
   resolveLanding(roomCode, room, currentPlayer, steps, false);
 }
 
@@ -974,7 +1125,6 @@ function handleTurnTimeout(roomCode) {
 
   const timedPlayerId = room._turnTimerForPlayerId;
   const timedMs = room._turnTimerMs;
-
   if (timedPlayerId && timedPlayerId !== current.id) return;
 
   clearTurnTimer(room);
@@ -1006,12 +1156,13 @@ function handleTurnTimeout(roomCode) {
   advanceTurn(room);
   emitGameState(roomCode);
 }
+/* === Socket.IO === */
 
-// ===== Socket.IO =====
 io.on('connection', (socket) => {
   socket.on('createRoom', ({ nickname }, callback) => {
     try {
       const roomCode = Math.random().toString(36).substring(2, 7).toUpperCase();
+
       const room = {
         hostId: socket.id,
         readyById: { [socket.id]: true },
@@ -1058,14 +1209,19 @@ io.on('connection', (socket) => {
 
       if (!rooms[roomCode] && isMongoReady()) {
         const loaded = await loadRoomFromDb(roomCode);
-        if (loaded) rooms[roomCode] = loaded;
+        if (loaded) {
+          normalizeRoom(loaded);
+          rooms[roomCode] = loaded;
+        }
       }
 
       const room = rooms[roomCode];
       if (!room) return callback?.({ ok: false, error: 'ROOM_NOT_FOUND' });
 
+      const nickKey = normalizeNickname(nickname);
+
       if (room.status !== 'waiting') {
-        const existingByNick = room.players.find((p) => p.nickname === nickname) || null;
+        const existingByNick = room.players.find((p) => normalizeNickname(p.nickname) === nickKey) || null;
         if (!existingByNick) return callback?.({ ok: false, error: 'GAME_ALREADY_STARTED' });
 
         const oldId = existingByNick.id;
@@ -1090,8 +1246,11 @@ io.on('connection', (socket) => {
         return;
       }
 
-      if (room.players.length >= 6) return callback?.({ ok: false, error: 'ROOM_FULL' });
-      if (room.players.some((p) => p.nickname === nickname)) return callback?.({ ok: false, error: 'NICKNAME_TAKEN' });
+      if (room.players.length >= 5) return callback?.({ ok: false, error: 'ROOM_FULL' });
+
+      if (room.players.some((p) => normalizeNickname(p.nickname) === nickKey)) {
+        return callback?.({ ok: false, error: 'NICKNAME_TAKEN' });
+      }
 
       const colorKey = pickNextColor(room);
       room.players.push(createPlayer(socket.id, nickname, colorKey));
@@ -1152,6 +1311,7 @@ io.on('connection', (socket) => {
       p.isDisconnected = false;
       p.disconnectedAt = null;
       p.missedTurnsWhileDisconnected = 0;
+      p.lapsCompleted = 0;
     });
 
     initDecks(room);
@@ -1179,19 +1339,56 @@ io.on('connection', (socket) => {
     io.to(roomCode).emit('newMessage', { nickname, message, timestamp: new Date().toISOString() });
   });
 
+  function handleUpgradeTile(payload, callback) {
+    try {
+      const { roomCode, tileId } = payload || {};
+      const room = rooms[String(roomCode || '')];
+      if (!room) return callback?.({ ok: false, error: 'ROOM_NOT_FOUND' });
+      if (room.status !== 'playing') return callback?.({ ok: false, error: 'NOT_PLAYING' });
+      if (room.gameOver) return callback?.({ ok: false, error: 'GAME_OVER' });
+
+      ensureCurrentIsActive(room);
+      const currentPlayer = room.players[room.currentPlayerIndex] || null;
+      if (!currentPlayer) return callback?.({ ok: false, error: 'NO_CURRENT_PLAYER' });
+      if (currentPlayer.id !== socket.id) return callback?.({ ok: false, error: 'NOT_YOUR_TURN' });
+      if (currentPlayer.isBankrupt) return callback?.({ ok: false, error: 'BANKRUPT' });
+      if (currentPlayer.isDisconnected) return callback?.({ ok: false, error: 'DISCONNECTED' });
+
+      if (room.phase !== 'awaiting_roll' || room.pending) return callback?.({ ok: false, error: 'NOT_IN_UPGRADE_PHASE' });
+
+      const id = Number(tileId);
+      const tile = room.board?.[id] || null;
+      if (!tile) return callback?.({ ok: false, error: 'TILE_NOT_FOUND' });
+
+      const result = applyUpgrade(roomCode, room, currentPlayer, tile);
+      if (!result.ok) return callback?.({ ok: false, error: result.error });
+
+      emitGameState(roomCode);
+      scheduleSave(roomCode);
+      return callback?.({ ok: true });
+    } catch (e) {
+      console.error('[upgradeTile] error:', e?.message || e);
+      return callback?.({ ok: false, error: 'SERVER_ERROR' });
+    }
+  }
+
+  socket.on('upgradeTile', handleUpgradeTile);
+  socket.on('upgrade_tile', handleUpgradeTile);
+
   function handleJailChoice({ roomCode, pay }, callback) {
     const room = rooms[roomCode];
-    if (!room || room.status !== 'playing') return callback?.({ ok: false });
-    if (room.gameOver) return callback?.({ ok: false });
+    if (!room || room.status !== 'playing') return callback?.({ ok: false, error: 'NOT_PLAYING' });
+    if (room.gameOver) return callback?.({ ok: false, error: 'GAME_OVER' });
 
     ensureCurrentIsActive(room);
     const currentPlayer = room.players[room.currentPlayerIndex];
-    if (!currentPlayer) return callback?.({ ok: false });
-    if (currentPlayer.id !== socket.id) return callback?.({ ok: false });
-    if (currentPlayer.isBankrupt || currentPlayer.isDisconnected) return callback?.({ ok: false });
+    if (!currentPlayer) return callback?.({ ok: false, error: 'NO_CURRENT_PLAYER' });
+    if (currentPlayer.id !== socket.id) return callback?.({ ok: false, error: 'NOT_YOUR_TURN' });
+    if (currentPlayer.isBankrupt) return callback?.({ ok: false, error: 'BANKRUPT' });
+    if (currentPlayer.isDisconnected) return callback?.({ ok: false, error: 'DISCONNECTED' });
 
     if (room.phase !== 'awaiting_jail_choice' || !room.pending || room.pending.type !== 'jail' || room.pending.playerId !== socket.id) {
-      return callback?.({ ok: false });
+      return callback?.({ ok: false, error: 'NOT_IN_JAIL_CHOICE' });
     }
 
     const fine = Number(room.pending.fine || JAIL_FINE);
@@ -1243,18 +1440,18 @@ io.on('connection', (socket) => {
 
   function handleCardAck({ roomCode }, callback) {
     const room = rooms[roomCode];
-    if (!room || room.status !== 'playing') return callback?.({ ok: false });
-    if (room.gameOver) return callback?.({ ok: false });
+    if (!room || room.status !== 'playing') return callback?.({ ok: false, error: 'NOT_PLAYING' });
+    if (room.gameOver) return callback?.({ ok: false, error: 'GAME_OVER' });
 
     ensureCurrentIsActive(room);
-
     const currentPlayer = room.players[room.currentPlayerIndex];
-    if (!currentPlayer) return callback?.({ ok: false });
-    if (currentPlayer.id !== socket.id) return callback?.({ ok: false });
-    if (currentPlayer.isBankrupt || currentPlayer.isDisconnected) return callback?.({ ok: false });
+    if (!currentPlayer) return callback?.({ ok: false, error: 'NO_CURRENT_PLAYER' });
+    if (currentPlayer.id !== socket.id) return callback?.({ ok: false, error: 'NOT_YOUR_TURN' });
+    if (currentPlayer.isBankrupt) return callback?.({ ok: false, error: 'BANKRUPT' });
+    if (currentPlayer.isDisconnected) return callback?.({ ok: false, error: 'DISCONNECTED' });
 
     if (room.phase !== 'awaiting_card_ack' || !room.pending || room.pending.type !== 'card' || room.pending.playerId !== socket.id) {
-      return callback?.({ ok: false });
+      return callback?.({ ok: false, error: 'NOT_IN_CARD_ACK' });
     }
 
     const pendingCard = safeClone(room.pending);
@@ -1262,7 +1459,7 @@ io.on('connection', (socket) => {
 
     applyCardEffectAfterAck(roomCode, room, currentPlayer, pendingCard);
     scheduleSave(roomCode);
-    callback?.({ ok: true });
+    return callback?.({ ok: true });
   }
 
   socket.on('cardAck', handleCardAck);
@@ -1274,11 +1471,10 @@ io.on('connection', (socket) => {
     if (room.gameOver) return callback?.({ ok: false, error: 'GAME_OVER' });
 
     ensureCurrentIsActive(room);
-
     const currentPlayer = room.players[room.currentPlayerIndex];
     if (!currentPlayer) return callback?.({ ok: false, error: 'NO_CURRENT_PLAYER' });
     if (currentPlayer.isBankrupt) return callback?.({ ok: false, error: 'BANKRUPT' });
-    if (currentPlayer.isDisconnected) return callback?.({ ok: false, error: 'DISCONNECTED' }); // <-- this blocks playing nonstop
+    if (currentPlayer.isDisconnected) return callback?.({ ok: false, error: 'DISCONNECTED' });
     if (currentPlayer.id !== socket.id) return callback?.({ ok: false, error: 'NOT_YOUR_TURN' });
 
     if (room.phase !== 'awaiting_roll') return callback?.({ ok: false, error: 'NOT_IN_ROLL_PHASE' });
@@ -1298,15 +1494,21 @@ io.on('connection', (socket) => {
 
     if (newPos >= len) {
       newPos = newPos % len;
-      currentPlayer.balance += 200;
-      appendLog(roomCode, `${currentPlayer.nickname} przeszedł przez START i otrzymał +200.`);
-      emitToastToPlayer(currentPlayer.id, { type: 'ok', text: 'START: +200' });
+      applyStartPass(roomCode, currentPlayer, 'kości');
     }
 
     currentPlayer.position = newPos;
     const tile = room.board[newPos];
 
-    io.to(roomCode).emit('diceRolled', { playerId: currentPlayer.id, nickname: currentPlayer.nickname, dice1, dice2, steps, newPosition: newPos, tile });
+    io.to(roomCode).emit('diceRolled', {
+      playerId: currentPlayer.id,
+      nickname: currentPlayer.nickname,
+      dice1,
+      dice2,
+      steps,
+      newPosition: newPos,
+      tile,
+    });
 
     const path = buildForwardPath(oldPos, steps, len);
     io.to(roomCode).emit('playerMovePath', { playerId: currentPlayer.id, path, reason: 'dice' });
@@ -1315,28 +1517,40 @@ io.on('connection', (socket) => {
 
     resolveLanding(roomCode, room, currentPlayer, steps, false);
     scheduleSave(roomCode);
-    callback?.({ ok: true });
+    return callback?.({ ok: true });
   });
 
   socket.on('buyTile', ({ roomCode }, callback) => {
     const room = rooms[roomCode];
-    if (!room || room.status !== 'playing' || room.gameOver) return callback?.({ ok: false });
+    if (!room) return callback?.({ ok: false, error: 'ROOM_NOT_FOUND' });
+    if (room.status !== 'playing') return callback?.({ ok: false, error: 'NOT_PLAYING' });
+    if (room.gameOver) return callback?.({ ok: false, error: 'GAME_OVER' });
 
     ensureCurrentIsActive(room);
     const currentPlayer = room.players[room.currentPlayerIndex];
-    if (!currentPlayer) return callback?.({ ok: false });
-    if (currentPlayer.id !== socket.id) return callback?.({ ok: false });
-    if (currentPlayer.isBankrupt || currentPlayer.isDisconnected) return callback?.({ ok: false });
+    if (!currentPlayer) return callback?.({ ok: false, error: 'NO_CURRENT_PLAYER' });
+    if (currentPlayer.isBankrupt) return callback?.({ ok: false, error: 'BANKRUPT' });
+    if (currentPlayer.isDisconnected) return callback?.({ ok: false, error: 'DISCONNECTED' });
+    if (currentPlayer.id !== socket.id) return callback?.({ ok: false, error: 'NOT_YOUR_TURN' });
 
-    if (room.phase !== 'awaiting_buy' || !room.pending || room.pending.playerId !== socket.id) return callback?.({ ok: false });
+    if (room.phase !== 'awaiting_buy' || !room.pending || room.pending.playerId !== socket.id) {
+      return callback?.({ ok: false, error: 'NOT_IN_BUY_PHASE' });
+    }
 
     const tile = room.board[currentPlayer.position];
-    if (!isBuyable(tile) || tile.ownerId || typeof tile.price !== 'number') return callback?.({ ok: false });
-    if (currentPlayer.balance < tile.price) return callback?.({ ok: false });
+    if (!isBuyable(tile)) return callback?.({ ok: false, error: 'NOT_BUYABLE' });
+    if (tile.ownerId) return callback?.({ ok: false, error: 'ALREADY_OWNED' });
+    if (typeof tile.price !== 'number') return callback?.({ ok: false, error: 'NO_PRICE' });
+    if (currentPlayer.balance < tile.price) return callback?.({ ok: false, error: 'NO_MONEY' });
 
     tile.ownerId = currentPlayer.id;
     currentPlayer.balance -= tile.price;
     currentPlayer.properties.push(tile.id);
+
+    if (tile.type === 'property') {
+      if (tile.houses === undefined) tile.houses = 0;
+      if (tile.hasHotel === undefined) tile.hasHotel = false;
+    }
 
     appendLog(roomCode, `${currentPlayer.nickname} kupił ${tile.name} za ${tile.price}.`);
     emitToastToPlayer(currentPlayer.id, { type: 'ok', text: `Kupiono: ${tile.name} (-${tile.price})` });
@@ -1344,6 +1558,7 @@ io.on('connection', (socket) => {
     room.phase = 'awaiting_roll';
     room.pending = null;
     advanceTurn(room);
+
     emitGameState(roomCode);
     scheduleSave(roomCode);
     callback?.({ ok: true });
@@ -1351,15 +1566,20 @@ io.on('connection', (socket) => {
 
   socket.on('skipBuy', ({ roomCode }, callback) => {
     const room = rooms[roomCode];
-    if (!room || room.status !== 'playing' || room.gameOver) return callback?.({ ok: false });
+    if (!room) return callback?.({ ok: false, error: 'ROOM_NOT_FOUND' });
+    if (room.status !== 'playing') return callback?.({ ok: false, error: 'NOT_PLAYING' });
+    if (room.gameOver) return callback?.({ ok: false, error: 'GAME_OVER' });
 
     ensureCurrentIsActive(room);
     const currentPlayer = room.players[room.currentPlayerIndex];
-    if (!currentPlayer) return callback?.({ ok: false });
-    if (currentPlayer.id !== socket.id) return callback?.({ ok: false });
-    if (currentPlayer.isBankrupt || currentPlayer.isDisconnected) return callback?.({ ok: false });
+    if (!currentPlayer) return callback?.({ ok: false, error: 'NO_CURRENT_PLAYER' });
+    if (currentPlayer.isBankrupt) return callback?.({ ok: false, error: 'BANKRUPT' });
+    if (currentPlayer.isDisconnected) return callback?.({ ok: false, error: 'DISCONNECTED' });
+    if (currentPlayer.id !== socket.id) return callback?.({ ok: false, error: 'NOT_YOUR_TURN' });
 
-    if (room.phase !== 'awaiting_buy' || !room.pending || room.pending.playerId !== socket.id) return callback?.({ ok: false });
+    if (room.phase !== 'awaiting_buy' || !room.pending || room.pending.playerId !== socket.id) {
+      return callback?.({ ok: false, error: 'NOT_IN_BUY_PHASE' });
+    }
 
     appendLog(roomCode, `${currentPlayer.nickname} nie kupił pola i kończy turę.`);
     emitToastToPlayer(currentPlayer.id, { type: 'ok', text: 'Pominięto zakup' });
@@ -1367,6 +1587,7 @@ io.on('connection', (socket) => {
     room.phase = 'awaiting_roll';
     room.pending = null;
     advanceTurn(room);
+
     emitGameState(roomCode);
     scheduleSave(roomCode);
     callback?.({ ok: true });
@@ -1404,7 +1625,6 @@ io.on('connection', (socket) => {
         continue;
       }
 
-      // PLAYING: mark disconnected, do NOT advance turn here
       pl.isDisconnected = true;
       pl.disconnectedAt = Date.now();
 
@@ -1416,6 +1636,8 @@ io.on('connection', (socket) => {
     }
   });
 });
+
+/* === HTTP === */
 
 app.get('/', (req, res) => res.send('Monopolista server is running'));
 

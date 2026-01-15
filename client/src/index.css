@@ -352,6 +352,7 @@ button:focus-visible{
 .player-owned--yellow { border-color: rgba(250,204,21,0.85);  background: rgba(250,204,21,0.10); }
 .player-owned--red    { border-color: rgba(239,68,68,0.85);   background: rgba(239,68,68,0.10); }
 .player-owned--green  { border-color: rgba(34,197,94,0.85);   background: rgba(34,197,94,0.10); }
+.player-owned--pink   { border-color: rgba(236,72,153,0.85);  background: rgba(236,72,153,0.10); }
 
 .player-card-name{ font-weight:900; margin-bottom:6px; }
 .player-card-meta{ font-size:12px; opacity:.9; }
@@ -524,7 +525,7 @@ button:focus-visible{
 /* Types */
 .board-tile--start { background: rgba(16,185,129,0.20); border-color: rgba(16,185,129,0.55); }
 .board-tile--tax { background: rgba(239,68,68,0.16); border-color: rgba(239,68,68,0.50); }
-.board-tile--station { background: rgba(148,163,184,0.12); border-color: rgba(148,163,184,0.45); }
+.board-tile--station { background: rgba(241,245,249,0.18); border-color: rgba(241,245,249,0.55); }
 .board-tile--utility { background: rgba(245,158,11,0.14); border-color: rgba(245,158,11,0.45); }
 .board-tile--random { background: rgba(167,139,250,0.14); border-color: rgba(167,139,250,0.45); }
 .board-tile--chest { background: rgba(34,211,238,0.10); border-color: rgba(34,211,238,0.40); }
@@ -537,6 +538,7 @@ button:focus-visible{
 .owned--yellow { border-color: rgba(250,204,21,0.90) !important;  background: rgba(250,204,21,0.16) !important; }
 .owned--red    { border-color: rgba(239,68,68,0.90) !important;   background: rgba(239,68,68,0.16) !important; }
 .owned--green  { border-color: rgba(34,197,94,0.90) !important;   background: rgba(34,197,94,0.16) !important; }
+.owned--pink   { border-color: rgba(236,72,153,0.90) !important;  background: rgba(236,72,153,0.16) !important; }
 
 /* Name panel */
 .tile-top{
@@ -563,7 +565,7 @@ button:focus-visible{
   overflow:hidden;
 }
 
-/* TOP/BOTTOM: vertical names */
+/* TOP/BOTTOM: vertical text without weird breaking */
 .tile-side--top .tile-top,
 .tile-side--bottom .tile-top{
   height:100%;
@@ -571,18 +573,29 @@ button:focus-visible{
   align-items:center;
   justify-content:center;
 }
+
 .tile-side--top .tile-name,
 .tile-side--bottom .tile-name{
   writing-mode: vertical-rl;
   text-orientation: mixed;
-  line-height: 1.02;
+
+  font-size: clamp(10px, 1.05vmin, 15px);
+  line-height: 1;
+
+  white-space: nowrap;
+  word-break: keep-all;
+  overflow-wrap: normal;
+  hyphens: none;
 
   display:block;
-  -webkit-line-clamp: unset;
   max-height:100%;
   overflow:hidden;
 }
-.tile-side--bottom .tile-name{ transform: rotate(180deg); }
+
+.tile-side--bottom .tile-name{
+  transform: rotate(180deg);
+}
+
 
 /* LEFT/RIGHT: horizontal names */
 .tile-side--left .tile-top,
